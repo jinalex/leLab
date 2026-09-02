@@ -6,8 +6,8 @@ import { Camera, MicOff } from 'lucide-react';
 interface MetricsPanelProps {
   activeTab: 'SENSORS' | 'MOTORS';
   setActiveTab: (tab: 'SENSORS' | 'MOTORS') => void;
-  sensorData: any[];
-  motorData: any[];
+  sensorData: Record<string, unknown>[];
+  motorData: Record<string, unknown>[];
   hasPermissions: boolean;
   streamRef: React.RefObject<MediaStream | null>;
   isVoiceActive: boolean;

@@ -23,6 +23,8 @@ import subprocess
 import sys
 import threading
 import time
+from collections.abc import Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -30,17 +32,19 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 from starlette.types import Scope
 
 # Import our custom recording functionality
-from . import datasets as dataset_browser, record as _record
+from . import datasets as dataset_browser, record as _record, rollout as _rollout
 
 # Import our custom calibration functionality
 from .calibrate import CalibrationRequest, calibration_manager
+from .control_coordinator import ControlCoordinator
+from .control_session import ControlOperation, ControlSessionError, ControlState
 from .jobs import (
     JobAlreadyRunningError,
     JobNotFoundError,
@@ -50,14 +54,12 @@ from .jobs import (
 )
 from .record import (
     DatasetInfoRequest,
-    RecordingRequest,
     UploadRequest,
     handle_delete_dataset,
     handle_exit_early,
     handle_get_dataset_info,
     handle_recording_status,
     handle_rerecord_episode,
-    handle_start_recording,
     handle_stop_recording,
     handle_upload_dataset,
 )
@@ -67,12 +69,15 @@ from .rollout import (
     handle_start_inference,
     handle_stop_inference,
 )
+from .stadia.dataset_safety import (
+    delete_dataset_safety_manifest,
+    read_dataset_safety_manifest,
+    write_dataset_safety_manifest,
+)
 
 # Import our custom teleoperation functionality
 from .teleoperate import (
-    TeleoperateRequest,
     handle_get_joint_positions,
-    handle_start_teleoperation,
     handle_stop_teleoperation,
     handle_teleoperation_status,
 )
@@ -84,18 +89,22 @@ from .utils import config
 from .utils.config import (
     FOLLOWER_CONFIG_PATH,
     LEADER_CONFIG_PATH,
+    RobotOperation,
+    RobotRecordV2,
+    RobotRecordValidationError,
     delete_robot_record,
     detect_port_after_disconnect,
+    evaluate_all_robot_readiness,
+    evaluate_robot_readiness,
     find_available_ports,
     find_robot_port,
     get_default_robot_port,
-    get_robot_record,
+    get_robot_record_v2,
     get_saved_robot_port,
     is_robot_record_clean,
     is_valid_robot_name,
-    list_robot_records,
     save_robot_port,
-    save_robot_record,
+    save_robot_record_v2,
 )
 from .utils.hf_auth import cached_whoami, handle_hf_auth_status, handle_hf_login, shared_hf_api
 from .utils.system import (
@@ -139,7 +148,40 @@ _flavors_cache: dict = {"data": None, "fetched_at": 0.0}
 _FLAVOR_CACHE_TTL_SECONDS = 300.0
 
 
-app = FastAPI()
+@contextlib.asynccontextmanager
+async def _app_lifespan(_app: FastAPI):  # type: ignore[no-untyped-def]
+    """Start the lease watchdog and wait boundedly for real owner teardown."""
+
+    coordinator = _control_for_lifespan_start()
+    coordinator.start_runtime()
+    try:
+        warn_if_cuda_mismatch()
+        yield
+    finally:
+        logger.info("🔄 FastAPI shutting down, cleaning up...")
+        result = await asyncio.to_thread(
+            coordinator.shutdown,
+            timeout_s=8.0,
+            reason="FastAPI server shutdown",
+        )
+        if not result.teardown_complete:
+            logger.error(
+                "Control teardown did not finish before shutdown timeout; "
+                "session %s remains unsafe and must not be bypassed%s",
+                result.session_id,
+                (f": {result.quarantine_reason}" if result.quarantine_reason is not None else ""),
+            )
+        if not result.watchdog_stopped:
+            logger.error("Control lease watchdog did not stop before shutdown timeout")
+        manager.stop_broadcast_thread()
+        logger.info(
+            "Shutdown cleanup attempt finished (control_teardown=%s, watchdog_stopped=%s)",
+            result.teardown_complete,
+            result.watchdog_stopped,
+        )
+
+
+app = FastAPI(lifespan=_app_lifespan)
 
 # In dev mode the React app runs on :8080 while the API runs on :8000; in
 # prod they share an origin and CORS is unnecessary. allow_credentials with
@@ -291,6 +333,570 @@ manager = ConnectionManager()
 job_registry.set_on_change(manager.notify_jobs_changed)
 job_registry.set_on_progress(manager.notify_job_progress)
 
+_control_lock = threading.Lock()
+_control_coordinator = ControlCoordinator()
+
+
+def _control() -> ControlCoordinator:
+    """Return the process lifecycle's shared control coordinator.
+
+    Ordinary requests never replace a failed/closing coordinator. Replacing it
+    mid-lifespan would create a fresh manager whose lease watchdog was never
+    started and could bypass the fail-closed state.
+    """
+
+    with _control_lock:
+        return _control_coordinator
+
+
+def _control_for_lifespan_start() -> ControlCoordinator:
+    """Return a coordinator whose runtime will be started by this lifespan."""
+
+    global _control_coordinator
+    with _control_lock:
+        if (
+            _control_coordinator.manager.closing
+            and _control_coordinator.manager.recyclable_after_shutdown
+            and _control_coordinator.manager.active_status(check_expiry=False) is None
+        ):
+            _control_coordinator = ControlCoordinator()
+        return _control_coordinator
+
+
+class ControlSessionBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    session_id: str = Field(min_length=1)
+
+
+class ControllerCheckBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    robot_name: str
+
+
+class InferenceCameraBinding(BaseModel):
+    """Policy alias bound to one camera from the saved robot record."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    type: Literal["opencv"]
+    camera_index: int = Field(ge=0)
+    width: int = Field(ge=1, le=8192)
+    height: int = Field(ge=1, le=8192)
+    fps: int | None = Field(default=None, ge=1, le=240)
+
+
+class CanonicalInferenceBody(BaseModel):
+    """Inference settings whose robot identity comes from a saved V2 record."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    robot_name: str
+    policy_ref: str
+    task: str = ""
+    cameras: dict[str, InferenceCameraBinding] = Field(default_factory=dict)
+    duration_s: int = Field(default=60, gt=0)
+
+
+class LegacyInferenceBody(BaseModel):
+    """Temporary compatibility shape for the pre-V2 inference frontend."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    follower_port: str
+    follower_config: str
+    policy_ref: str
+    task: str = ""
+    cameras: dict[str, InferenceCameraBinding] = Field(default_factory=dict)
+    duration_s: int = Field(default=60, gt=0)
+
+
+def _control_failure(
+    error: Exception,
+    *,
+    requested_session_id: str | None = None,
+) -> JSONResponse:
+    if isinstance(error, ControlSessionError):
+        status_code = 409
+    elif isinstance(error, FileNotFoundError):
+        status_code = 404
+    elif isinstance(error, RobotRecordValidationError):
+        status_code = 422
+    elif isinstance(error, (ValidationError, ValueError, TypeError)):
+        status_code = 400
+    else:
+        status_code = 500
+    content: dict[str, Any] = {"success": False, "message": str(error)}
+    if requested_session_id is not None:
+        content["requested_session_id"] = requested_session_id
+    if isinstance(error, ControlSessionError):
+        try:
+            coordinator = _control()
+        except Exception:
+            coordinator = globals().get("_control_coordinator")
+        if isinstance(coordinator, ControlCoordinator):
+            status = coordinator.manager.active_status(check_expiry=False)
+            if status is None and requested_session_id is not None:
+                status = coordinator.manager.status_for(
+                    requested_session_id,
+                    check_expiry=False,
+                )
+            if status is not None:
+                content["session_id"] = status.session_id
+                content["status"] = status.as_dict()
+    return JSONResponse(status_code=status_code, content=content)
+
+
+_REQUEST_ERROR_STATUS = {
+    "robot_not_found": 404,
+    "robot_invalid": 422,
+    "robot_not_ready": 409,
+    "legacy_no_match": 409,
+    "legacy_ambiguous": 409,
+    "legacy_mode_unsupported": 409,
+}
+
+
+def _control_result(result: Mapping[str, Any], *, default_error_status: int = 500):
+    """Return a successful mapping or a truthful non-2xx JSON failure."""
+
+    payload = dict(result)
+    if payload.get("success") is True:
+        return payload
+    status_code = payload.get("status_code")
+    if not isinstance(status_code, int) or not 400 <= status_code <= 599:
+        error = payload.get("error")
+        code = error.get("code") if isinstance(error, Mapping) else None
+        status_code = _REQUEST_ERROR_STATUS.get(str(code), default_error_status)
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+def _require_saved_robot(name: str) -> RobotRecordV2:
+    """Load one exact saved record and distinguish missing from malformed."""
+
+    if not is_valid_robot_name(name):
+        raise ValueError("robot_name is not a valid saved robot name")
+    path = Path(config.ROBOTS_PATH) / f"{name}.json"
+    existed = path.is_file()
+    record = get_robot_record_v2(name)
+    if record is not None:
+        return record
+    if existed:
+        raise RobotRecordValidationError(f"saved robot record {name!r} exists but is not valid JSON")
+    raise FileNotFoundError(f"saved robot record {name!r} was not found")
+
+
+def _strict_robot_records() -> list[RobotRecordV2]:
+    """Load every saved record without silently dropping malformed siblings."""
+
+    root = Path(config.ROBOTS_PATH)
+    if not root.exists():
+        return []
+    try:
+        paths = sorted(path for path in root.iterdir() if path.suffix == ".json")
+    except OSError as error:
+        raise RobotRecordValidationError(f"could not list saved robot records: {error}") from error
+    records: list[RobotRecordV2] = []
+    for path in paths:
+        if not is_valid_robot_name(path.stem):
+            raise RobotRecordValidationError(f"saved robot filename {path.name!r} is invalid")
+        records.append(_require_saved_robot(path.stem))
+    return records
+
+
+def _status_response(status) -> dict[str, Any]:  # type: ignore[no-untyped-def]
+    return {
+        "success": True,
+        "session_id": status.session_id,
+        "status": status.as_dict(),
+    }
+
+
+def _matching_control_status(operations: set[ControlOperation]):
+    status = _control().status()
+    if status is None or status.operation not in operations:
+        return None
+    return status
+
+
+_RECORDING_OPERATIONS = {
+    ControlOperation.LEADER_RECORDING,
+    ControlOperation.STADIA_RECORDING,
+}
+
+
+def _stadia_recording_payload(status) -> dict[str, Any]:  # type: ignore[no-untyped-def]
+    """Return worker-published recording truth or a conservative fallback."""
+
+    published = status.details.get("recording")
+    if isinstance(published, Mapping):
+        payload = dict(published)
+        if payload.get("session_id") != status.session_id:
+            return {
+                "session_id": status.session_id,
+                "recording_active": not status.terminal,
+                "current_phase": "error",
+                "session_ended": status.terminal,
+                "dataset_safe": False,
+                "dataset_finalized": False,
+                "dataset_uploaded": False,
+                "upload_available": False,
+                "camera_feed_available": False,
+                "cameras": [],
+                "message": "Recording status is invalid; inspect the session error.",
+                "available_controls": {
+                    "stop_recording": not status.terminal,
+                    "exit_early": False,
+                    "rerecord_episode": False,
+                },
+                "error": "recording worker published a contradictory session identity",
+            }
+        return payload
+    return {
+        "session_id": status.session_id,
+        "recording_active": not status.terminal,
+        "current_phase": "preparing" if not status.terminal else "error",
+        "session_ended": status.terminal,
+        "dataset_safe": False,
+        "dataset_finalized": False,
+        "dataset_uploaded": False,
+        "upload_available": False,
+        "camera_feed_available": False,
+        "cameras": [],
+        "message": (
+            "Recording session ended without a complete worker status."
+            if status.terminal
+            else "Recording is preparing; waiting for the worker status."
+        ),
+        "available_controls": {
+            "stop_recording": not status.terminal,
+            "exit_early": False,
+            "rerecord_episode": False,
+        },
+        "error": (
+            status.stop_reason
+            if status.terminal
+            else "recording worker has not published its initial status yet"
+        ),
+    }
+
+
+def _recording_command(
+    body: ControlSessionBody | None,
+    *,
+    worker_method: str,
+    fallback,
+):  # type: ignore[no-untyped-def]
+    """Dispatch one recording event without crossing the active owner."""
+
+    coordinator = _control()
+    status = coordinator.manager.active_status()
+    if status is None:
+        if body is None:
+            return fallback()
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "message": "No active recording session owns this event.",
+                "session_id": body.session_id,
+            },
+        )
+    if status.operation not in _RECORDING_OPERATIONS:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "message": f"Control is owned by {status.operation.value}, not recording.",
+                "session_id": status.session_id,
+                "status": status.as_dict(),
+            },
+        )
+    if body is not None and body.session_id != status.session_id:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "message": f"Session {body.session_id!r} does not own recording.",
+                "session_id": status.session_id,
+                "status": status.as_dict(),
+            },
+        )
+    if status.operation is ControlOperation.LEADER_RECORDING:
+        return fallback()
+    if body is None:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "success": False,
+                "message": "session_id is required for a Stadia recording event.",
+                "session_id": status.session_id,
+                "status": status.as_dict(),
+            },
+        )
+    worker = coordinator.active_managed_worker(
+        body.session_id,
+        operation=ControlOperation.STADIA_RECORDING,
+    )
+    if worker is None:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "message": "The Stadia recording owner is no longer available.",
+                "session_id": status.session_id,
+                "status": status.as_dict(),
+            },
+        )
+    method = getattr(worker, worker_method, None)
+    if not callable(method):
+        return JSONResponse(
+            status_code=500,
+            content={
+                "success": False,
+                "message": f"The recording owner does not support {worker_method}.",
+                "session_id": status.session_id,
+                "status": status.as_dict(),
+            },
+        )
+    try:
+        raw_result = method()
+        if not isinstance(raw_result, Mapping):
+            raise TypeError("recording event handlers must return a mapping")
+        result = dict(raw_result)
+    except Exception as error:
+        latest = coordinator.status(status.session_id) or status
+        failure = _control_failure(error)
+        content = json.loads(failure.body)
+        content.update(
+            {
+                "session_id": latest.session_id,
+                "status": latest.as_dict(),
+            }
+        )
+        return JSONResponse(status_code=failure.status_code, content=content)
+    latest = coordinator.status(status.session_id) or status
+    return _control_result(
+        {
+            **result,
+            "session_id": latest.session_id,
+            "status": latest.as_dict(),
+        },
+        default_error_status=409,
+    )
+
+
+def _stadia_dataset_guard(dataset_repo_id: str) -> str | None:
+    """Explain why a retained Stadia dataset must not use the legacy uploader."""
+
+    try:
+        durable = read_dataset_safety_manifest(dataset_repo_id)
+    except Exception as error:
+        return f"The Stadia dataset safety record is invalid: {type(error).__name__}: {error}"
+    if durable is not None:
+        if durable.dataset_uploaded:
+            return "The Stadia dataset was already uploaded by its recording owner."
+        if not durable.dataset_safe:
+            return durable.error or "The Stadia dataset is not proven safe."
+        if not durable.dataset_finalized:
+            return "The Stadia dataset is not proven finalized."
+        if durable.saved_episodes < 1:
+            return "The Stadia dataset contains no proven saved episodes."
+        return None
+
+    coordinator = _control()
+    active = coordinator.manager.active_status(check_expiry=False)
+    candidates = ([active] if active is not None else []) + list(
+        reversed(coordinator.manager.terminal_history())
+    )
+    for status in candidates:
+        if status.operation is not ControlOperation.STADIA_RECORDING:
+            continue
+        recording = status.details.get("recording")
+        if not isinstance(recording, Mapping):
+            continue
+        if recording.get("dataset_repo_id") != dataset_repo_id:
+            continue
+        if not status.terminal:
+            return "The Stadia recording is still active or tearing down."
+        if recording.get("dataset_safe") is not True:
+            return str(recording.get("error") or "The Stadia dataset is not proven safe.")
+        if recording.get("dataset_finalized") is not True:
+            return "The Stadia dataset is not proven finalized."
+        return None
+    return None
+
+
+def _stop_matching_operation(
+    operations: set[ControlOperation],
+    *,
+    reason: str,
+    fallback,
+):  # type: ignore[no-untyped-def]
+    coordinator = _control()
+    active = coordinator.manager.active_status()
+    if active is None:
+        return fallback()
+    if active.operation not in operations:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "message": (f"Control is owned by {active.operation.value}; this endpoint cannot stop it."),
+                "session_id": active.session_id,
+                "status": active.as_dict(),
+            },
+        )
+    try:
+        return _status_response(coordinator.request_stop(active.session_id, reason=reason))
+    except Exception as error:
+        return _control_failure(error)
+
+
+def _calibration_is_active() -> bool:
+    # Avoid CalibrationManager.get_status(), which may perform a serial read.
+    # The ownership monitor needs only the already-published lifecycle flag and
+    # the worker's liveness. A stop handler may publish idle before a lingering
+    # thread has actually released its resources.
+    snapshot = calibration_manager.get_status()
+    worker = calibration_manager.calibration_thread
+    if worker is not None and worker.is_alive():
+        return True
+    return bool(snapshot.calibration_active and not snapshot.cleanup_pending)
+
+
+def _capture_calibration_status() -> dict[str, Any]:
+    """Retain passive legacy outcome evidence in the exact shared session."""
+
+    from dataclasses import asdict
+
+    snapshot = asdict(calibration_manager.get_status())
+    coordinator = _control()
+    active = coordinator.manager.active_status(check_expiry=False)
+    if (
+        active is not None
+        and active.operation
+        in {
+            ControlOperation.FOLLOWER_CALIBRATION,
+            ControlOperation.LEADER_CALIBRATION,
+        }
+        and not active.terminal
+    ):
+        coordinator.manager.merge_details(active.session_id, {"calibration": snapshot})
+    return snapshot
+
+
+def _resolve_inference_cameras(
+    record: RobotRecordV2,
+    requested: Mapping[str, InferenceCameraBinding],
+) -> dict[str, dict[str, Any]]:
+    """Bind policy aliases only to exact cameras in the saved robot record.
+
+    The alias names belong to the selected policy, but every physical camera
+    field is server-owned. Requiring the checkpoint dimensions to match the
+    saved record prevents a browser from silently changing capture settings.
+    """
+
+    resolved: dict[str, dict[str, Any]] = {}
+    used_camera_ids: set[str] = set()
+    for alias, binding in requested.items():
+        if (
+            not alias
+            or alias.strip() != alias
+            or any(
+                not (character.isascii() and (character.isalnum() or character in "_.-"))
+                for character in alias
+            )
+        ):
+            raise ValueError(
+                "inference camera aliases may contain only ASCII letters, digits, dot, dash, and underscore"
+            )
+        matches = [camera for camera in record.cameras if camera.camera_index == binding.camera_index]
+        if not matches:
+            raise ValueError(
+                f"inference camera {alias!r} does not match a camera in saved robot {record.name!r}"
+            )
+        if len(matches) != 1:
+            raise ValueError(
+                f"inference camera index {binding.camera_index} is ambiguous in saved robot {record.name!r}"
+            )
+        camera = matches[0]
+        if camera.id in used_camera_ids:
+            raise ValueError(f"saved camera {camera.id!r} cannot be bound to more than one policy alias")
+        if (
+            binding.width != camera.width
+            or binding.height != camera.height
+            or (binding.fps is not None and binding.fps != camera.fps)
+        ):
+            raise ValueError(
+                f"inference camera {alias!r} settings do not exactly match saved camera {camera.name!r}"
+            )
+        if camera.fourcc is not None and any(
+            not (character.isascii() and (character.isalnum() or character == " "))
+            for character in camera.fourcc
+        ):
+            raise ValueError(f"saved camera {camera.name!r} has an unsafe FOURCC value")
+
+        used_camera_ids.add(camera.id)
+        camera_config: dict[str, Any] = {
+            "type": camera.type,
+            "camera_index": camera.camera_index,
+            "width": camera.width,
+            "height": camera.height,
+            "fps": camera.fps,
+        }
+        if camera.fourcc is not None:
+            camera_config["fourcc"] = camera.fourcc
+        if camera.backend is not None:
+            camera_config["backend"] = camera.backend
+        resolved[alias] = camera_config
+    return resolved
+
+
+def _resolve_inference_request(
+    raw: Mapping[str, Any],
+) -> tuple[RobotRecordV2, InferenceRequest]:
+    """Resolve canonical or temporary follower-only compatibility input."""
+
+    if "robot_name" in raw:
+        parsed = CanonicalInferenceBody.model_validate(raw)
+        record = _require_saved_robot(parsed.robot_name)
+    else:
+        parsed_legacy = LegacyInferenceBody.model_validate(raw)
+        matches = [
+            candidate
+            for candidate in _strict_robot_records()
+            if candidate.follower.port == parsed_legacy.follower_port
+            and candidate.follower.calibration == parsed_legacy.follower_config
+        ]
+        if not matches:
+            raise ValueError("legacy inference identity does not exactly match a saved robot record")
+        if len(matches) != 1:
+            raise ValueError("legacy inference identity is ambiguous; use robot_name")
+        record = matches[0]
+        parsed = CanonicalInferenceBody(
+            robot_name=record.name,
+            policy_ref=parsed_legacy.policy_ref,
+            task=parsed_legacy.task,
+            cameras=parsed_legacy.cameras,
+            duration_s=parsed_legacy.duration_s,
+        )
+
+    readiness = evaluate_robot_readiness(record, RobotOperation.INFERENCE)
+    if not readiness.ready:
+        reasons = " ".join(issue.message for issue in readiness.issues)
+        raise ValueError(f"saved robot is not ready for inference: {reasons}")
+    cameras = _resolve_inference_cameras(record, parsed.cameras)
+    return record, InferenceRequest(
+        follower_port=record.follower.port,
+        follower_config=record.follower.calibration,
+        policy_ref=parsed.policy_ref,
+        task=parsed.task,
+        cameras=cameras,
+        duration_s=parsed.duration_s,
+    )
+
 
 @app.get("/get-configs")
 def get_configs():
@@ -302,21 +908,128 @@ def get_configs():
 
 
 @app.post("/move-arm")
-def teleoperate_arm(request: TeleoperateRequest):
-    """Start teleoperation of the robot arm"""
-    return handle_start_teleoperation(request, manager)
+def teleoperate_arm(request: dict[str, Any]):
+    """Resolve one saved robot and start its leader or Stadia owner."""
+
+    try:
+        result = _control().start_teleoperation(request, websocket_manager=manager)
+    except Exception as error:
+        return _control_failure(error)
+    return _control_result(result)
 
 
 @app.post("/stop-teleoperation")
-def stop_teleoperation():
-    """Stop the current teleoperation session"""
-    return handle_stop_teleoperation()
+def stop_teleoperation(body: ControlSessionBody | None = None):
+    """Compatibility stop route backed by the shared exact owner."""
+
+    active = _control().manager.active_status()
+    if active is not None and active.operation is ControlOperation.STADIA_TELEOPERATION:
+        if body is None or body.session_id != active.session_id:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "success": False,
+                    "message": "Stadia teleoperation stop requires its exact active session_id.",
+                    "session_id": active.session_id,
+                    "status": active.as_dict(),
+                },
+            )
+        try:
+            return _status_response(
+                _control().request_stop(
+                    body.session_id,
+                    reason="teleoperation stop requested by UI",
+                )
+            )
+        except Exception as error:
+            return _control_failure(error)
+
+    return _stop_matching_operation(
+        {ControlOperation.LEADER_TELEOPERATION},
+        reason="teleoperation stop requested by UI",
+        fallback=handle_stop_teleoperation,
+    )
 
 
 @app.get("/teleoperation-status")
 def teleoperation_status():
-    """Get the current teleoperation status"""
-    return handle_teleoperation_status()
+    """Keep legacy fields while attaching the persistent shared status."""
+
+    result = handle_teleoperation_status()
+    status = _matching_control_status(
+        {
+            ControlOperation.LEADER_TELEOPERATION,
+            ControlOperation.STADIA_TELEOPERATION,
+        }
+    )
+    if status is not None:
+        result.update(
+            {
+                "session_id": status.session_id,
+                "control_status": status.as_dict(),
+                "teleoperation_active": not status.terminal,
+            }
+        )
+        result["available_controls"]["stop_teleoperation"] = not status.terminal
+    return result
+
+
+@app.get("/control-status")
+def control_status(session_id: str | None = None):
+    """Return the exact active or retained terminal session status."""
+
+    try:
+        status = _control().status(session_id)
+    except Exception as error:
+        return _control_failure(error)
+    if status is None:
+        content: dict[str, Any] = {
+            "success": False,
+            "message": "Control session status was not found.",
+        }
+        if session_id is not None:
+            content["session_id"] = session_id
+        return JSONResponse(
+            status_code=404,
+            content=content,
+        )
+    return _status_response(status)
+
+
+@app.post("/control-lease/renew")
+def renew_control_lease(body: ControlSessionBody):
+    """Renew only the exact starting/running owner lease."""
+
+    try:
+        return _status_response(_control().renew_lease(body.session_id))
+    except Exception as error:
+        return _control_failure(error, requested_session_id=body.session_id)
+
+
+@app.post("/control-stop")
+def stop_control(body: ControlSessionBody):
+    """Signal one exact owner; cleanup remains worker-owned and asynchronous."""
+
+    try:
+        return _status_response(
+            _control().request_stop(
+                body.session_id,
+                reason="stop requested by control UI",
+            )
+        )
+    except Exception as error:
+        return _control_failure(error, requested_session_id=body.session_id)
+
+
+@app.post("/controller-check")
+def controller_check(body: ControllerCheckBody):
+    """Start the pygame-only controller check without importing a robot path."""
+
+    try:
+        result = _control().start_controller_check(body.robot_name)
+    except Exception as error:
+        return _control_failure(error)
+    return _control_result(result, default_error_status=400)
 
 
 @app.get("/joint-positions")
@@ -326,30 +1039,114 @@ def get_joint_positions():
 
 
 @app.post("/start-inference")
-def start_inference(request: InferenceRequest):
-    result = handle_start_inference(request)
-    if not result.get("success"):
-        raise HTTPException(
-            status_code=result.get("status_code", 500),
-            detail=result.get("message", "Failed to start inference"),
+def start_inference(request: dict[str, Any]):
+    try:
+        record, legacy_request = _resolve_inference_request(request)
+        coordinator = _control()
+        owned_process: object | None = None
+        retained_terminal_snapshot: dict[str, Any] | None = None
+
+        def capture_inference_status() -> dict[str, Any]:
+            nonlocal retained_terminal_snapshot
+            raw_status = handle_inference_status()
+            if not isinstance(raw_status, Mapping):
+                raise TypeError("inference status handler must return a mapping")
+            snapshot = dict(raw_status)
+            if retained_terminal_snapshot is not None and not snapshot.get("inference_active"):
+                snapshot = dict(retained_terminal_snapshot)
+            elif not snapshot.get("inference_active") and (
+                snapshot.get("exited") is True
+                or snapshot.get("outcome") in {"failed", "ran_with_warning", "stopped", "completed"}
+            ):
+                retained_terminal_snapshot = dict(snapshot)
+            active_status = coordinator.manager.active_status(check_expiry=False)
+            if (
+                active_status is not None
+                and active_status.operation is ControlOperation.INFERENCE
+                and not active_status.terminal
+            ):
+                coordinator.manager.merge_details(
+                    active_status.session_id,
+                    {"inference": snapshot},
+                )
+            return snapshot
+
+        def start_owned_inference() -> Mapping[str, Any]:
+            nonlocal owned_process
+            result = handle_start_inference(legacy_request)
+            owned_process = _rollout._inference_proc
+            capture_inference_status()
+            return result
+
+        def stop_owned_inference() -> Mapping[str, Any]:
+            nonlocal owned_process
+            owned_process = _rollout._inference_proc or owned_process
+            return handle_stop_inference()
+
+        def owned_inference_is_active() -> bool:
+            snapshot = capture_inference_status()
+            active = bool(snapshot.get("inference_active"))
+            if owned_process is None:
+                return active
+            poll = getattr(owned_process, "poll", None)
+            if not callable(poll):
+                raise TypeError("inference process must expose poll()")
+            return active or poll() is None
+
+        result = coordinator.start_external_operation(
+            ControlOperation.INFERENCE,
+            teleoperator_type=record.teleoperator_type,
+            start=start_owned_inference,
+            stop=stop_owned_inference,
+            is_active=owned_inference_is_active,
+            terminal_status=capture_inference_status,
+            details={
+                "robot_name": record.name,
+                "policy_ref": legacy_request.policy_ref,
+            },
         )
-    return result
+    except Exception as error:
+        return _control_failure(error)
+    return _control_result(result)
 
 
 @app.post("/stop-inference")
 def stop_inference():
-    result = handle_stop_inference()
-    if not result.get("success"):
-        raise HTTPException(
-            status_code=result.get("status_code", 500),
-            detail=result.get("message", "Failed to stop inference"),
-        )
-    return result
+    return _stop_matching_operation(
+        {ControlOperation.INFERENCE},
+        reason="inference stop requested by UI",
+        fallback=handle_stop_inference,
+    )
 
 
 @app.get("/inference-status")
 def inference_status():
-    return handle_inference_status()
+    status = _matching_control_status({ControlOperation.INFERENCE})
+    if status is not None:
+        retained = status.details.get("inference")
+        if isinstance(retained, Mapping):
+            result = dict(retained)
+        else:
+            result = {
+                "inference_active": not status.terminal,
+                "started_at": None,
+                "rollout_started_at": None,
+                "elapsed_s": 0.0,
+                "rollout_elapsed_s": 0.0,
+                "duration_s": None,
+                "policy_ref": status.details.get("policy_ref"),
+                "log_path": None,
+            }
+        result.update(
+            {
+                "session_id": status.session_id,
+                "control_status": status.as_dict(),
+                "inference_active": not status.terminal,
+            }
+        )
+        return result
+    raw_result = handle_inference_status()
+    return dict(raw_result) if isinstance(raw_result, Mapping) else {}
 
 
 @app.get("/health")
@@ -425,21 +1222,80 @@ async def websocket_endpoint(websocket: WebSocket):
 
 
 @app.post("/start-recording")
-def start_recording(request: RecordingRequest):
-    """Start a dataset recording session"""
-    return handle_start_recording(request)
+def start_recording(request: dict[str, Any]):
+    """Resolve one saved robot and start its leader or Stadia recorder."""
+
+    try:
+        result = _control().start_recording(request)
+    except Exception as error:
+        return _control_failure(error)
+    return _control_result(result)
 
 
 @app.post("/stop-recording")
-def stop_recording():
-    """Stop the current recording session"""
-    return handle_stop_recording()
+def stop_recording(body: ControlSessionBody | None = None):
+    """Compatibility stop route backed by the shared exact owner."""
+
+    active = _control().manager.active_status()
+    if active is not None and active.operation is ControlOperation.STADIA_RECORDING:
+        if body is None or body.session_id != active.session_id:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "success": False,
+                    "message": "Stadia recording stop requires its exact active session_id.",
+                    "session_id": active.session_id,
+                    "status": active.as_dict(),
+                },
+            )
+        try:
+            return _status_response(
+                _control().request_stop(
+                    body.session_id,
+                    reason="recording stop requested by UI",
+                )
+            )
+        except Exception as error:
+            return _control_failure(error)
+
+    return _stop_matching_operation(
+        {ControlOperation.LEADER_RECORDING},
+        reason="recording stop requested by UI",
+        fallback=handle_stop_recording,
+    )
 
 
 @app.get("/recording-status")
 def recording_status():
-    """Get the current recording status"""
-    return handle_recording_status()
+    """Keep legacy fields while attaching the persistent shared status."""
+
+    status = _matching_control_status(_RECORDING_OPERATIONS)
+    if status is not None and status.operation is ControlOperation.STADIA_RECORDING:
+        # One immutable manager snapshot supplies both the compatibility fields
+        # and nested control status. A second mutable worker read could combine
+        # two different revisions in one response.
+        result = _stadia_recording_payload(status)
+        result.update(
+            {
+                "session_id": status.session_id,
+                "control_status": status.as_dict(),
+            }
+        )
+        return result
+
+    result = handle_recording_status()
+    if status is not None:
+        active = not status.terminal
+        result.update(
+            {
+                "session_id": status.session_id,
+                "control_status": status.as_dict(),
+                "recording_active": active,
+                "session_ended": status.terminal,
+            }
+        )
+        result["available_controls"]["stop_recording"] = active
+    return result
 
 
 @app.get("/camera-feed/{cam_key}")
@@ -450,6 +1306,12 @@ def camera_feed(cam_key: str):
     frontend just points an <img> at this URL. Only valid while a session is
     active; the generator ends itself when recording stops.
     """
+    status = _matching_control_status(_RECORDING_OPERATIONS)
+    if status is not None and status.operation is ControlOperation.STADIA_RECORDING:
+        raise HTTPException(
+            status_code=404,
+            detail="Live camera preview is not exposed by the Stadia recording owner.",
+        )
     if not _record.recording_active:
         raise HTTPException(status_code=409, detail="No active recording session")
     return StreamingResponse(
@@ -459,21 +1321,53 @@ def camera_feed(cam_key: str):
 
 
 @app.post("/recording-exit-early")
-def recording_exit_early():
+def recording_exit_early(body: ControlSessionBody | None = None):
     """Skip to next episode (replaces right arrow key)"""
-    return handle_exit_early()
+    return _recording_command(
+        body,
+        worker_method="finish_episode",
+        fallback=handle_exit_early,
+    )
 
 
 @app.post("/recording-rerecord-episode")
-def recording_rerecord_episode():
+def recording_rerecord_episode(body: ControlSessionBody | None = None):
     """Re-record current episode (replaces left arrow key)"""
-    return handle_rerecord_episode()
+    return _recording_command(
+        body,
+        worker_method="rerecord_episode",
+        fallback=handle_rerecord_episode,
+    )
 
 
 @app.post("/upload-dataset")
 def upload_dataset(request: UploadRequest):
     """Upload dataset to HuggingFace Hub"""
-    return handle_upload_dataset(request)
+    blocked = _stadia_dataset_guard(request.dataset_repo_id)
+    if blocked is not None:
+        return JSONResponse(
+            status_code=409,
+            content={
+                "success": False,
+                "message": blocked,
+                "dataset_repo_id": request.dataset_repo_id,
+            },
+        )
+    durable = read_dataset_safety_manifest(request.dataset_repo_id)
+    result = handle_upload_dataset(request)
+    if durable is not None and isinstance(result, Mapping) and result.get("success") is True:
+        try:
+            write_dataset_safety_manifest(replace(durable, dataset_uploaded=True))
+        except Exception as error:
+            return {
+                **dict(result),
+                "success": False,
+                "message": (
+                    "Dataset upload completed, but durable upload state could not be recorded: "
+                    f"{type(error).__name__}: {error}"
+                ),
+            }
+    return result
 
 
 @app.post("/dataset-info")
@@ -485,7 +1379,20 @@ def get_dataset_info(request: DatasetInfoRequest):
 @app.post("/delete-dataset")
 def delete_dataset(request: DatasetInfoRequest):
     """Remove a recorded dataset directory from local disk."""
-    return handle_delete_dataset(request)
+
+    result = handle_delete_dataset(request)
+    if isinstance(result, Mapping) and result.get("success") is True:
+        try:
+            delete_dataset_safety_manifest(request.dataset_repo_id)
+        except Exception as error:
+            return {
+                "success": False,
+                "message": (
+                    "Dataset was removed, but its Stadia safety record could not be removed: "
+                    f"{type(error).__name__}: {error}"
+                ),
+            }
+    return result
 
 
 # ============================================================================
@@ -806,29 +1713,174 @@ def run_update():
 # Calibration endpoints
 @app.post("/start-calibration")
 def start_calibration(request: CalibrationRequest):
-    """Start calibration process"""
-    return calibration_manager.start_calibration(request)
+    """Start one calibration owner while preserving the legacy worker."""
+
+    try:
+        if not is_valid_robot_name(request.config_file):
+            raise ValueError("config_file must be a safe non-empty basename")
+        operation = (
+            ControlOperation.FOLLOWER_CALIBRATION
+            if request.device_type == "robot"
+            else ControlOperation.LEADER_CALIBRATION
+        )
+        resolved_request = request
+        details: dict[str, Any] = {
+            "device_type": request.device_type,
+            "config_file": request.config_file,
+        }
+        target_calibration = f"{request.config_file}.json"
+        if request.robot_name is None:
+            matches: list[RobotRecordV2] = []
+            for candidate in _strict_robot_records():
+                device = candidate.follower if request.device_type == "robot" else candidate.leader
+                if (
+                    device is not None
+                    and device.port == request.port
+                    and device.calibration == target_calibration
+                ):
+                    matches.append(candidate)
+            if not matches:
+                raise ValueError("legacy calibration identity does not match a saved robot; send robot_name")
+            if len(matches) != 1:
+                raise ValueError("legacy calibration identity is ambiguous; send robot_name")
+            record = matches[0]
+            resolved_request = replace(request, robot_name=record.name)
+        else:
+            record = _require_saved_robot(request.robot_name)
+
+        robot_operation = (
+            RobotOperation.FOLLOWER_CALIBRATION
+            if request.device_type == "robot"
+            else RobotOperation.LEADER_CALIBRATION
+        )
+        readiness = evaluate_robot_readiness(record, robot_operation)
+        if not readiness.ready:
+            reasons = " ".join(issue.message for issue in readiness.issues)
+            raise ValueError(f"saved robot is not ready for calibration: {reasons}")
+        device = record.follower if request.device_type == "robot" else record.leader
+        if device is None:
+            raise ValueError("saved robot has no leader configuration")
+        if request.port != device.port:
+            raise ValueError("calibration port must match the saved robot record")
+        if target_calibration != device.calibration:
+            raise ValueError("calibration destination must match the saved robot record")
+        teleoperator_type = record.teleoperator_type
+        details["robot_name"] = record.name
+
+        result = _control().start_external_operation(
+            operation,
+            teleoperator_type=teleoperator_type,
+            start=lambda: calibration_manager.start_calibration(resolved_request),
+            stop=calibration_manager.stop_calibration_process,
+            is_active=_calibration_is_active,
+            terminal_status=_capture_calibration_status,
+            details=details,
+        )
+    except Exception as error:
+        return _control_failure(error)
+    return _control_result(result)
 
 
 @app.post("/stop-calibration")
-def stop_calibration():
-    """Stop calibration process"""
-    return calibration_manager.stop_calibration_process()
+def stop_calibration(body: ControlSessionBody | None = None):
+    """Signal the exact calibration owner and let it clean up."""
+
+    active = _control().manager.active_status()
+    calibration_operations = {
+        ControlOperation.FOLLOWER_CALIBRATION,
+        ControlOperation.LEADER_CALIBRATION,
+    }
+    if active is not None and active.operation in calibration_operations:
+        if body is None or body.session_id != active.session_id:
+            return JSONResponse(
+                status_code=409,
+                content={
+                    "success": False,
+                    "message": "Calibration stop requires its exact active session_id.",
+                    "session_id": active.session_id,
+                    "status": active.as_dict(),
+                },
+            )
+        try:
+            return _status_response(
+                _control().request_stop(
+                    body.session_id,
+                    reason="calibration stop requested by UI",
+                )
+            )
+        except Exception as error:
+            return _control_failure(error)
+
+    return _stop_matching_operation(
+        calibration_operations,
+        reason="calibration stop requested by UI",
+        fallback=calibration_manager.stop_calibration_process,
+    )
 
 
 @app.get("/calibration-status")
 def calibration_status():
-    """Get current calibration status"""
+    """Get legacy calibration data plus the shared lifecycle status."""
     from dataclasses import asdict
 
     status = calibration_manager.get_status()
-    return asdict(status)
+    result = asdict(status)
+    control = _matching_control_status(
+        {
+            ControlOperation.FOLLOWER_CALIBRATION,
+            ControlOperation.LEADER_CALIBRATION,
+        }
+    )
+    if control is not None:
+        result.update(
+            {
+                "session_id": control.session_id,
+                "control_status": control.as_dict(),
+                "calibration_active": not control.terminal,
+            }
+        )
+    return result
 
 
 @app.post("/complete-calibration-step")
-def complete_calibration_step():
-    """Complete the current calibration step"""
-    return calibration_manager.complete_step()
+def complete_calibration_step(body: ControlSessionBody):
+    """Advance only the exact active calibration owner."""
+
+    active = _control().manager.active_status()
+    if (
+        active is None
+        or active.operation
+        not in {
+            ControlOperation.FOLLOWER_CALIBRATION,
+            ControlOperation.LEADER_CALIBRATION,
+        }
+        or active.session_id != body.session_id
+        or active.state not in {ControlState.STARTING, ControlState.RUNNING}
+    ):
+        content: dict[str, Any] = {
+            "success": False,
+            "message": "Calibration step requires its exact active session_id.",
+            "session_id": body.session_id,
+        }
+        if active is not None:
+            content["active_session_id"] = active.session_id
+            content["status"] = active.as_dict()
+        return JSONResponse(status_code=409, content=content)
+    try:
+        raw = calibration_manager.complete_step()
+        result = dict(raw) if isinstance(raw, Mapping) else {"success": False, "message": "Invalid result"}
+        latest = _control().status(body.session_id)
+        if latest is None:
+            raise RuntimeError("calibration session status disappeared")
+        return _control_result(
+            {
+                **result,
+                "session_id": body.session_id,
+                "status": latest.as_dict(),
+            }
+        )
+    except Exception as error:
+        return _control_failure(error)
 
 
 @app.get("/calibration-configs/{device_type}")
@@ -1163,31 +2215,65 @@ def get_robot_config(robot_type: RobotSideLiteral, available_configs: str = ""):
 # Robot config records (named robots)
 
 
-def _record_with_clean(record: dict) -> dict:
-    """Attach `is_clean` to a record for API responses."""
-    return {**record, "is_clean": is_robot_record_clean(record)}
+def _record_for_api(record: RobotRecordV2) -> dict[str, Any]:
+    """Attach static readiness and controller-check exclusivity to V2 JSON."""
+
+    readiness = {
+        operation: result.model_dump(mode="json")
+        for operation, result in evaluate_all_robot_readiness(record).items()
+    }
+    active = _control().manager.active_status()
+    controller = readiness[RobotOperation.CONTROLLER_CHECK.value]
+    if active is not None:
+        controller["ready"] = False
+        controller["issues"] = [
+            *controller["issues"],
+            {
+                "code": "control_session_busy",
+                "field": None,
+                "message": (
+                    f"Control is currently owned by {active.operation.value}; wait for teardown to finish."
+                ),
+            },
+        ]
+    return {
+        **record.model_dump(mode="json"),
+        "readiness": readiness,
+        # Temporary compatibility for screens not yet migrated to an exact
+        # operation readiness key.
+        "is_clean": is_robot_record_clean(record),
+    }
 
 
 @app.get("/robots")
 def get_robots():
-    """List all saved robot records."""
+    """List every saved record as canonical V2 or fail closed."""
     try:
-        records = [_record_with_clean(r) for r in list_robot_records()]
+        records = [_record_for_api(record) for record in _strict_robot_records()]
         return {"status": "success", "robots": records}
-    except Exception as e:
-        logger.error(f"Error listing robots: {e}")
-        return {"status": "error", "message": str(e), "robots": []}
+    except Exception as error:
+        logger.error("Error listing robots: %s", error)
+        return JSONResponse(
+            status_code=422,
+            content={"status": "error", "message": str(error), "robots": []},
+        )
 
 
 @app.get("/robots/{name}")
 def get_robot(name: str):
-    """Get a single robot record by name."""
+    """Get one strict canonical V2 record by name."""
     if not is_valid_robot_name(name):
         return JSONResponse(status_code=400, content={"status": "error", "message": "Invalid robot name"})
-    record = get_robot_record(name)
-    if record is None:
+    try:
+        record = _require_saved_robot(name)
+    except FileNotFoundError:
         return JSONResponse(status_code=404, content={"status": "error", "message": "Robot not found"})
-    return {"status": "success", "robot": _record_with_clean(record)}
+    except RobotRecordValidationError as error:
+        return JSONResponse(
+            status_code=422,
+            content={"status": "error", "message": str(error)},
+        )
+    return {"status": "success", "robot": _record_for_api(record)}
 
 
 @app.post("/robots/{name}")
@@ -1204,22 +2290,28 @@ def upsert_robot(name: str, data: dict, create: bool = False):
     if not is_valid_robot_name(name):
         return JSONResponse(status_code=400, content={"status": "error", "message": "Invalid robot name"})
     try:
+        path = Path(config.ROBOTS_PATH) / f"{name}.json"
         if create:
-            if get_robot_record(name) is not None:
+            if path.exists():
                 return JSONResponse(
                     status_code=409,
                     content={"status": "error", "message": "A robot with this name already exists"},
                 )
-            save_robot_record(name, data or {}, allow_create=True)
+            record = save_robot_record_v2(name, data or {}, allow_create=True)
         else:
-            save_robot_record(name, data or {}, allow_create=False)
-        record = get_robot_record(name)
+            record = save_robot_record_v2(name, data or {}, allow_create=False)
         if record is None:
             return {"status": "success", "robot": None}
-        return {"status": "success", "robot": _record_with_clean(record)}
-    except Exception as e:
-        logger.error(f"Error upserting robot {name}: {e}")
-        return JSONResponse(status_code=500, content={"status": "error", "message": str(e)})
+        return {"status": "success", "robot": _record_for_api(record)}
+    except RobotRecordValidationError as error:
+        logger.error("Invalid robot update for %s: %s", name, error)
+        return JSONResponse(
+            status_code=400,
+            content={"status": "error", "message": str(error)},
+        )
+    except Exception as error:
+        logger.error("Error upserting robot %s: %s", name, error)
+        return JSONResponse(status_code=500, content={"status": "error", "message": str(error)})
 
 
 @app.delete("/robots/{name}")
@@ -1230,24 +2322,6 @@ def delete_robot(name: str):
     if delete_robot_record(name):
         return {"status": "success"}
     return JSONResponse(status_code=404, content={"status": "error", "message": "Robot not found"})
-
-
-@app.on_event("startup")
-def startup_event():
-    """One-time startup diagnostics surfaced in the server terminal."""
-    warn_if_cuda_mismatch()
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Clean up resources when FastAPI shuts down"""
-    logger.info("🔄 FastAPI shutting down, cleaning up...")
-
-    # Stop any active recording - handled by recording module cleanup
-
-    if manager:
-        manager.stop_broadcast_thread()
-    logger.info("✅ Cleanup completed")
 
 
 def _accepts_html(accept: str) -> bool:

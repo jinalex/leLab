@@ -5,11 +5,8 @@ const FLAG = "lelab:teleop-stopped";
 
 /**
  * One-time confirmation that teleoperation was stopped during the previous
- * page's unload (a browser navigation, reload, or tab close from the
- * teleoperation page set a sessionStorage flag, since React cleanup can't run
- * in those cases). On the next fresh load we surface a toast wherever the user
- * landed, then clear the flag. In-app navigation away from teleop toasts
- * directly and never sets the flag, so this never double-fires.
+ * page's unload. Historical builds set this flag before knowing whether
+ * teardown completed, so it can only confirm that a stop was requested.
  */
 const TeleopStopNotice = () => {
   const { toast } = useToast();
@@ -24,8 +21,9 @@ const TeleopStopNotice = () => {
     }
     if (stopped) {
       toast({
-        title: "Teleoperation stopped",
-        description: "The arm was disconnected cleanly when you left the page.",
+        title: "Teleoperation stop was requested",
+        description:
+          "A page-unload request is best effort. Re-check server status before assuming torque is off.",
       });
     }
   }, [toast]);

@@ -33,7 +33,7 @@ from lerobot.teleoperators.so_leader import SO101LeaderConfig
 
 from .dataset_repair import DatasetRepairError, repair_local_dataset
 from .utils.config import setup_calibration_files, with_lelab_tag
-from .utils.devices import safe_disconnect_device
+from .utils.devices import DeviceCleanupError, safe_disconnect_device
 
 logger = logging.getLogger(__name__)
 
@@ -226,6 +226,11 @@ def handle_start_recording(request: RecordingRequest) -> dict[str, Any]:
     with _state_lock:
         if recording_active:
             return {"success": False, "message": "Recording is already active"}
+        if last_recording_info and last_recording_info.get("cleanup_pending"):
+            return {
+                "success": False,
+                "message": "Previous recording cleanup is unproven; restart LeLab before retrying",
+            }
         if _teleoperate.teleoperation_active:
             return {"success": False, "message": "Teleoperation is currently active. Stop it first."}
         if _rollout.inference_active:
@@ -330,6 +335,7 @@ def handle_start_recording(request: RecordingRequest) -> dict[str, Any]:
                     "error": str(e),
                     "dataset_repo_id": request.dataset_repo_id,
                     "saved_episodes": saved_episodes,
+                    "cleanup_pending": (isinstance(e, DeviceCleanupError) and not e.cleanup_proven),
                 }
             finally:
                 if current_phase != "error":
@@ -375,6 +381,8 @@ def handle_stop_recording() -> dict[str, Any]:
         "success": True,
         "message": "Recording stop requested successfully",
         "session_ending": True,
+        "stop_pending": True,
+        "cleanup_proven": False,
     }
 
 
@@ -444,6 +452,29 @@ def handle_recording_status() -> dict[str, Any]:
             else "Recording status retrieved successfully"
         ),
     }
+
+    # Stable, machine-readable terminal evidence for the shared coordinator.
+    # `current_phase` and `last_recording_info` are retained until the next
+    # start, so repeated polls cannot turn a natural worker exception into idle.
+    if recording_active:
+        status.update({"exited": False, "outcome": "running", "error": None, "cleanup_pending": False})
+    elif current_phase == "error":
+        status.update(
+            {
+                "exited": True,
+                "outcome": "failed",
+                "error": (
+                    last_recording_info.get("error", "Unknown error")
+                    if last_recording_info
+                    else "Unknown error"
+                ),
+                "cleanup_pending": bool(last_recording_info and last_recording_info.get("cleanup_pending")),
+            }
+        )
+    elif current_phase == "completed":
+        status.update({"exited": True, "outcome": "completed", "error": None, "cleanup_pending": False})
+    else:
+        status.update({"exited": False, "outcome": "idle", "error": None, "cleanup_pending": False})
 
     # Always echo the stamped dataset id whenever a config exists, so the frontend
     # can read the actual on-disk repo_id (post stamp) for upload navigation.
@@ -653,6 +684,30 @@ def handle_upload_dataset(request: UploadRequest) -> dict[str, Any]:
                 "docs_url": "https://huggingface.co/docs/huggingface_hub/en/quick-start#authentication",
             }
         return {"success": False, "message": f"Failed to upload dataset: {str(e)}"}
+
+
+def _cleanup_recording_devices(robot: Any, teleop: Any) -> None:
+    """Attempt both legacy device teardowns and preserve aggregate proof."""
+
+    cleanup_errors: list[str] = []
+    cleanup_proven = True
+    for label, device in (("follower", robot), ("leader", teleop)):
+        if device is None:
+            continue
+        try:
+            safe_disconnect_device(device, logger, context="recording cleanup")
+        except DeviceCleanupError as exc:
+            cleanup_errors.append(f"{label}: {exc}")
+            cleanup_proven = cleanup_proven and exc.cleanup_proven
+        except Exception as exc:
+            cleanup_errors.append(f"{label}: {exc}")
+            cleanup_proven = False
+    if cleanup_errors:
+        raise DeviceCleanupError(
+            "recording cleanup",
+            cleanup_errors,
+            cleanup_proven=cleanup_proven,
+        )
 
 
 def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDataset:
@@ -972,12 +1027,10 @@ def record_with_web_events(cfg: RecordConfig, web_events: dict) -> LeRobotDatase
             dataset.finalize()
         finally:
             # safe_disconnect_device force-releases the serial port / cameras if
-            # a normal disconnect fails, so a flaky teardown can't leave the
-            # device busy and block the next recording session (see issue #50).
-            # Nested so a failed finalize can't strand the hardware.
-            safe_disconnect_device(robot, logger, context="recording cleanup")
-            if teleop:
-                safe_disconnect_device(teleop, logger, context="recording cleanup")
+            # a normal disconnect fails. Attempt both devices even when one
+            # reports unproven cleanup, then raise aggregate evidence so the
+            # recording worker retains a terminal failure for the coordinator.
+            _cleanup_recording_devices(robot, teleop)
 
     if cfg.dataset.push_to_hub:
         if dataset.num_episodes > 0:

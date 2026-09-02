@@ -1,4 +1,5 @@
 import React from "react";
+import { useNavigate } from "react-router-dom";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { NumberInput } from "@/components/ui/number-input";
@@ -19,10 +20,12 @@ import {
 import { Alert, AlertDescription } from "@/components/ui/alert";
 import { AlertTriangle, CheckCircle, ChevronDown } from "lucide-react";
 import CameraConfiguration, {
-  CameraConfig,
+  type CameraConfig,
 } from "@/components/recording/CameraConfiguration";
 import { useHfAuth } from "@/contexts/HfAuthContext";
-import { RobotRecord } from "@/hooks/useRobots";
+import type { RobotRecord } from "@/hooks/useRobots";
+import { readinessFor, recordingOperation } from "@/lib/robotConfig";
+import { isExactDatasetRepoComponent } from "@/lib/recordingContract";
 
 interface RecordingModalProps {
   open: boolean;
@@ -68,8 +71,17 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
   releaseStreamsRef,
 }) => {
   const { auth } = useHfAuth();
+  const navigate = useNavigate();
 
-  const canStart = !!robot && robot.is_clean;
+  const recordingReadiness = robot
+    ? readinessFor(robot, recordingOperation(robot))
+    : null;
+  const stadiaRepositoryReady =
+    robot?.teleoperator_type !== "stadia" ||
+    (auth.status === "authenticated" &&
+      isExactDatasetRepoComponent(auth.username));
+  const canStart =
+    recordingReadiness?.ready === true && stadiaRepositoryReady;
 
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
@@ -102,20 +114,43 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
                     recording.
                   </AlertDescription>
                 </Alert>
-              ) : !robot.is_clean ? (
+              ) : !recordingReadiness?.ready ? (
                 <Alert className="bg-amber-900/40 border-amber-700 text-amber-100">
                   <AlertTriangle className="h-4 w-4" />
                   <AlertDescription>
-                    <strong>{robot.name}</strong> is missing a calibration.
-                    Configure it before recording.
+                    <strong>{robot.name}</strong> is not ready for {robot.teleoperator_type === "stadia" ? "Stadia" : "leader-arm"} recording. {recordingReadiness?.issues
+                      .map((issue) => issue.message)
+                      .join(" ")}
                   </AlertDescription>
                 </Alert>
               ) : (
                 <div className="flex items-center gap-2 text-sm">
                   <CheckCircle className="w-4 h-4 text-green-400" />
                   <span className="text-slate-200">
-                    Recording with <strong>{robot.name}</strong>
+                    Recording with <strong>{robot.name}</strong> using {robot.teleoperator_type === "stadia" ? "the Stadia controller" : "the leader arm"}
                   </span>
+                </div>
+              )}
+              {robot?.teleoperator_type === "stadia" && (
+                <div className="space-y-2">
+                  <p className="text-xs text-slate-400">
+                    Stadia recording uses the saved follower calibration and
+                    exact saved camera settings. The leader arm is not opened.
+                  </p>
+                  <Button
+                    type="button"
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      onOpenChange(false);
+                      navigate("/calibration", {
+                        state: { robot_name: robot.name },
+                      });
+                    }}
+                    className="border-slate-600 text-slate-200 hover:bg-slate-800"
+                  >
+                    Edit saved robot cameras
+                  </Button>
                 </div>
               )}
             </div>
@@ -124,6 +159,16 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
               <h3 className="text-lg font-semibold text-white border-b border-gray-700 pb-2">
                 Dataset Configuration
               </h3>
+              {robot?.teleoperator_type === "stadia" &&
+                !stadiaRepositoryReady && (
+                  <Alert className="bg-amber-900/40 border-amber-700 text-amber-100">
+                    <AlertTriangle className="h-4 w-4" />
+                    <AlertDescription>
+                      Sign in to Hugging Face before Stadia recording. Its
+                      dataset repository must be exactly namespace/name.
+                    </AlertDescription>
+                  </Alert>
+                )}
               <div className="grid grid-cols-1 gap-4">
                 <div className="space-y-2">
                   <Label
@@ -237,7 +282,15 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
             <div className="space-y-3">
               <CameraConfiguration
                 cameras={cameras}
-                onCamerasChange={setCameras}
+                onCamerasChange={
+                  robot?.teleoperator_type === "stadia"
+                    ? () => {
+                        // Stadia starts must project the exact saved camera
+                        // records. Runtime index refreshes belong on the saved
+                        // robot configuration screen, not this start dialog.
+                      }
+                    : setCameras
+                }
                 releaseStreamsRef={releaseStreamsRef}
                 readOnly
               />

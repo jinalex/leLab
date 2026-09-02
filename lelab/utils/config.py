@@ -18,8 +18,13 @@ import os
 import platform
 import shutil
 import time
+from collections.abc import Mapping
+from enum import StrEnum
+from numbers import Real
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 logger = logging.getLogger(__name__)
 
@@ -330,6 +335,202 @@ _INVALID_NAME_CHARS = ("/", "\\", "..")
 _ROBOT_STRING_FIELDS = ("leader_port", "follower_port", "leader_config", "follower_config")
 _ROBOT_LIST_FIELDS = ("cameras",)
 
+_LEGACY_RECORD_FIELDS = {
+    "name",
+    *_ROBOT_STRING_FIELDS,
+    *_ROBOT_LIST_FIELDS,
+}
+_V2_RECORD_FIELDS = {
+    "schema_version",
+    "name",
+    "teleoperator_type",
+    "follower",
+    "leader",
+    "stadia",
+    "cameras",
+}
+_LEGACY_ONLY_RECORD_FIELDS = set(_ROBOT_STRING_FIELDS)
+_V2_ONLY_RECORD_FIELDS = {
+    "schema_version",
+    "teleoperator_type",
+    "follower",
+    "leader",
+    "stadia",
+}
+
+
+class RobotRecordValidationError(ValueError):
+    """A saved robot record or robot-record patch violates its schema."""
+
+
+class DeviceRecord(BaseModel):
+    """One serial device and its saved calibration filename.
+
+    Blank values are valid while a robot record is being configured. Readiness,
+    rather than persistence, decides whether an operation can start.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    port: str = ""
+    calibration: str = ""
+
+    @field_validator("port")
+    @classmethod
+    def _validate_port(cls, value: str) -> str:
+        if "\x00" in value:
+            raise ValueError("port cannot contain a NUL byte")
+        return value
+
+    @field_validator("calibration")
+    @classmethod
+    def _validate_calibration(cls, value: str) -> str:
+        if not value:
+            return value
+        if value.strip() != value:
+            raise ValueError("calibration filename cannot have surrounding whitespace")
+        if not value.endswith(".json"):
+            raise ValueError("calibration filename must end with .json")
+        if Path(value).name != value or "/" in value or "\\" in value or ".." in value:
+            raise ValueError("calibration filename must be a safe basename")
+        return value
+
+
+class CameraRecord(BaseModel):
+    """The OpenCV camera fields already persisted by LeLab's frontend."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    id: str
+    name: str
+    type: Literal["opencv"] = "opencv"
+    # The existing recorder has always defaulted a missing legacy index to 0.
+    # Keep that normalization behavior while still persisting a concrete V2
+    # value on the next explicit save.
+    camera_index: int = Field(default=0, ge=0)
+    device_id: str = ""
+    width: int = Field(default=640, ge=1, le=8192)
+    height: int = Field(default=480, ge=1, le=8192)
+    fps: int | None = Field(default=30, ge=1, le=240)
+    fourcc: str | None = Field(default=None, min_length=4, max_length=4)
+    backend: (
+        Literal[
+            "ANY",
+            "V4L2",
+            "DSHOW",
+            "PVAPI",
+            "ANDROID",
+            "AVFOUNDATION",
+            "MSMF",
+        ]
+        | None
+    ) = None
+
+    @field_validator("id", "name")
+    @classmethod
+    def _validate_required_string(cls, value: str) -> str:
+        if not value or value.strip() != value:
+            raise ValueError("camera id and name must be non-empty and trimmed")
+        return value
+
+    @field_validator("device_id")
+    @classmethod
+    def _validate_device_id(cls, value: str) -> str:
+        if "\x00" in value:
+            raise ValueError("camera device_id cannot contain a NUL byte")
+        return value
+
+
+class StadiaConfig(BaseModel):
+    """Persisted, user-selectable Stadia settings with plan-owned safety caps."""
+
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+
+    guid: str | None = None
+    deadzone: float = Field(default=0.15, ge=0.0, lt=1.0)
+    max_step_per_tick: float = Field(default=0.35, gt=0.0, le=0.35)
+    arm_startup_travel_degrees: float = Field(default=45.0, gt=0.0, le=45.0)
+    gripper_startup_travel_percentage_points: float = Field(default=45.0, gt=0.0, le=45.0)
+
+    @field_validator(
+        "deadzone",
+        "max_step_per_tick",
+        "arm_startup_travel_degrees",
+        "gripper_startup_travel_percentage_points",
+        mode="before",
+    )
+    @classmethod
+    def _validate_numeric_type(cls, value: object) -> float:
+        # Pydantic's normal float parsing accepts strings and bools. Robot
+        # safety settings must arrive as actual JSON numbers.
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError("Stadia settings must be numeric values")
+        return float(value)
+
+    @field_validator("guid")
+    @classmethod
+    def _validate_guid(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        if not value or value.strip() != value or "\x00" in value:
+            raise ValueError("guid must be non-empty, trimmed, and contain no NUL byte")
+        return value
+
+
+class RobotRecordV1(BaseModel):
+    """Strict schema for the legacy flat records already stored by LeLab."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = ""
+    leader_port: str = ""
+    follower_port: str = ""
+    leader_config: str = ""
+    follower_config: str = ""
+    cameras: list[CameraRecord] = Field(default_factory=list)
+
+
+class RobotRecordV2(BaseModel):
+    """Canonical server-owned robot configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal[2] = 2
+    name: str
+    teleoperator_type: Literal["leader_arm", "stadia"] = "leader_arm"
+    follower: DeviceRecord = Field(default_factory=DeviceRecord)
+    leader: DeviceRecord | None = Field(default_factory=DeviceRecord)
+    stadia: StadiaConfig = Field(default_factory=StadiaConfig)
+    cameras: list[CameraRecord] = Field(default_factory=list)
+
+
+class RobotOperation(StrEnum):
+    FOLLOWER_CALIBRATION = "follower_calibration"
+    LEADER_CALIBRATION = "leader_calibration"
+    LEADER_TELEOPERATION = "leader_teleoperation"
+    STADIA_TELEOPERATION = "stadia_teleoperation"
+    LEADER_RECORDING = "leader_recording"
+    STADIA_RECORDING = "stadia_recording"
+    INFERENCE = "inference"
+    REPLAY = "replay"
+    CONTROLLER_CHECK = "controller_check"
+
+
+class ReadinessIssue(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: str
+    field: str | None
+    message: str
+
+
+class ReadinessResult(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operation: RobotOperation
+    ready: bool
+    issues: tuple[ReadinessIssue, ...] = ()
+
 
 def _robot_record_path(name: str) -> str:
     return os.path.join(ROBOTS_PATH, f"{name}.json")
@@ -353,22 +554,108 @@ def _empty_record(name: str) -> dict:
     return record
 
 
-def get_robot_record(name: str) -> dict | None:
-    """Return the robot record by name, or None if missing."""
+def _validation_error(message: str, error: Exception | None = None) -> RobotRecordValidationError:
+    if error is None:
+        return RobotRecordValidationError(message)
+    return RobotRecordValidationError(f"{message}: {error}")
+
+
+def normalize_robot_record(name: str, raw: Mapping[str, Any]) -> RobotRecordV2:
+    """Normalize a strict legacy or V2 record without writing it.
+
+    The filename is authoritative for ``name``. Legacy records are interpreted
+    as leader-arm records and receive default Stadia settings in memory.
+    """
+    if not is_valid_robot_name(name):
+        raise _validation_error(f"invalid robot name {name!r}")
+    if not isinstance(raw, Mapping):
+        raise _validation_error("robot record must be a JSON object")
+
+    data = dict(raw)
+    keys = set(data)
+    is_v2 = bool(keys & _V2_ONLY_RECORD_FIELDS)
+    if is_v2 and keys & _LEGACY_ONLY_RECORD_FIELDS:
+        raise _validation_error("robot record cannot mix legacy flat fields with V2 fields")
+
+    try:
+        if is_v2:
+            unknown = keys - _V2_RECORD_FIELDS
+            if unknown:
+                raise _validation_error(f"unknown V2 robot-record fields: {sorted(unknown)}")
+            data["name"] = name
+            return RobotRecordV2.model_validate(data)
+
+        unknown = keys - _LEGACY_RECORD_FIELDS
+        if unknown:
+            raise _validation_error(f"unknown legacy robot-record fields: {sorted(unknown)}")
+        data["name"] = name
+        legacy = RobotRecordV1.model_validate(data)
+        return RobotRecordV2(
+            name=name,
+            teleoperator_type="leader_arm",
+            follower=DeviceRecord(
+                port=legacy.follower_port,
+                calibration=legacy.follower_config,
+            ),
+            leader=DeviceRecord(
+                port=legacy.leader_port,
+                calibration=legacy.leader_config,
+            ),
+            cameras=legacy.cameras,
+        )
+    except RobotRecordValidationError:
+        raise
+    except ValidationError as error:
+        raise _validation_error(f"invalid robot record {name!r}", error) from error
+
+
+def _read_robot_record_data(name: str) -> dict[str, Any] | None:
     path = _robot_record_path(name)
     if not os.path.exists(path):
         return None
     try:
         with open(path) as f:
             data = json.load(f)
-    except (json.JSONDecodeError, OSError) as e:
-        logger.error(f"Failed to read robot record {name}: {e}")
+    except (json.JSONDecodeError, OSError) as error:
+        logger.error(f"Failed to read robot record {name}: {error}")
         return None
-    # Ensure all expected fields exist (forward/back compat)
-    record = _empty_record(name)
-    record.update({k: v for k, v in data.items() if k in record})
-    record["name"] = name
-    return record
+    if not isinstance(data, dict):
+        raise _validation_error(f"robot record {name!r} must contain a JSON object")
+    return data
+
+
+def get_robot_record_v2(name: str) -> RobotRecordV2 | None:
+    """Load and normalize a record without mutating its file."""
+    raw = _read_robot_record_data(name)
+    if raw is None:
+        return None
+    return normalize_robot_record(name, raw)
+
+
+load_robot_record = get_robot_record_v2
+
+
+def _legacy_record_projection(record: RobotRecordV2) -> dict[str, Any]:
+    """Project V2 into the flat shape consumed by existing routes/features."""
+    leader = record.leader or DeviceRecord()
+    return {
+        "name": record.name,
+        "leader_port": leader.port,
+        "follower_port": record.follower.port,
+        "leader_config": leader.calibration,
+        "follower_config": record.follower.calibration,
+        "cameras": [camera.model_dump(mode="json", exclude_none=True) for camera in record.cameras],
+    }
+
+
+def get_robot_record(name: str) -> dict | None:
+    """Return the legacy flat projection by name, or None if missing/invalid."""
+    try:
+        record = get_robot_record_v2(name)
+    except RobotRecordValidationError as error:
+        logger.error(f"Failed to validate robot record {name}: {error}")
+        return None
+    return _legacy_record_projection(record) if record is not None else None
 
 
 def list_robot_records() -> list[dict]:
@@ -386,6 +673,120 @@ def list_robot_records() -> list[dict]:
     return records
 
 
+def list_robot_records_v2() -> list[RobotRecordV2]:
+    """Return all valid canonical robot records without modifying disk state."""
+    if not os.path.exists(ROBOTS_PATH):
+        return []
+    records = []
+    for filename in sorted(os.listdir(ROBOTS_PATH)):
+        if not filename.endswith(".json"):
+            continue
+        name = os.path.splitext(filename)[0]
+        record = get_robot_record_v2(name)
+        if record is not None:
+            records.append(record)
+    return records
+
+
+def _apply_legacy_patch(base: dict[str, Any], patch: Mapping[str, Any]) -> None:
+    unknown = set(patch) - _LEGACY_RECORD_FIELDS
+    if unknown:
+        raise _validation_error(f"unknown legacy robot-record fields: {sorted(unknown)}")
+    for field in _ROBOT_STRING_FIELDS:
+        if field not in patch:
+            continue
+        value = patch[field]
+        if not isinstance(value, str):
+            raise _validation_error(f"legacy field {field!r} must be a string")
+        if field == "leader_port":
+            leader = base.get("leader") or {}
+            leader["port"] = value
+            base["leader"] = leader
+        elif field == "follower_port":
+            base["follower"]["port"] = value
+        elif field == "leader_config":
+            leader = base.get("leader") or {}
+            leader["calibration"] = value
+            base["leader"] = leader
+        elif field == "follower_config":
+            base["follower"]["calibration"] = value
+    if "cameras" in patch:
+        base["cameras"] = patch["cameras"]
+
+
+def _apply_v2_patch(name: str, base: dict[str, Any], patch: Mapping[str, Any]) -> None:
+    unknown = set(patch) - _V2_RECORD_FIELDS
+    if unknown:
+        raise _validation_error(f"unknown V2 robot-record fields: {sorted(unknown)}")
+    if set(patch) & _LEGACY_ONLY_RECORD_FIELDS:
+        raise _validation_error("robot-record patch cannot mix legacy flat fields with V2 fields")
+    if "name" in patch and patch["name"] != name:
+        raise _validation_error("robot-record body name must match the path name")
+    if "schema_version" in patch and patch["schema_version"] != 2:
+        raise _validation_error("schema_version must be 2")
+
+    for field in ("teleoperator_type", "cameras"):
+        if field in patch:
+            base[field] = patch[field]
+    for field in ("follower", "stadia"):
+        if field not in patch:
+            continue
+        value = patch[field]
+        if not isinstance(value, Mapping):
+            raise _validation_error(f"V2 field {field!r} must be an object")
+        base[field].update(value)
+    if "leader" in patch:
+        value = patch["leader"]
+        if value is None:
+            base["leader"] = None
+        elif isinstance(value, Mapping):
+            leader = base.get("leader") or DeviceRecord().model_dump(mode="json")
+            leader.update(value)
+            base["leader"] = leader
+        else:
+            raise _validation_error("V2 field 'leader' must be an object or null")
+
+
+def save_robot_record_v2(
+    name: str,
+    data: Mapping[str, Any],
+    allow_create: bool = True,
+) -> RobotRecordV2 | None:
+    """Strictly merge and atomically persist a canonical V2 robot record."""
+    if not is_valid_robot_name(name):
+        raise _validation_error(f"invalid robot name {name!r}")
+    if not isinstance(data, Mapping):
+        raise _validation_error("robot-record patch must be a JSON object")
+
+    existing = get_robot_record_v2(name)
+    if existing is None and not allow_create:
+        return None
+    record = existing or RobotRecordV2(name=name)
+    merged = record.model_dump(mode="json")
+    patch = dict(data)
+    has_legacy = bool(set(patch) & _LEGACY_ONLY_RECORD_FIELDS)
+    has_v2 = bool(set(patch) & _V2_ONLY_RECORD_FIELDS)
+    if has_legacy and has_v2:
+        raise _validation_error("robot-record patch cannot mix legacy flat fields with V2 fields")
+
+    if has_legacy:
+        _apply_legacy_patch(merged, patch)
+    else:
+        _apply_v2_patch(name, merged, patch)
+    merged["name"] = name
+
+    try:
+        normalized = RobotRecordV2.model_validate(merged)
+    except ValidationError as error:
+        raise _validation_error(f"invalid robot-record patch for {name!r}", error) from error
+
+    os.makedirs(ROBOTS_PATH, exist_ok=True)
+    path = _robot_record_path(name)
+    _atomic_write_text(path, json.dumps(normalized.model_dump(mode="json"), indent=2))
+    logger.info(f"Saved V2 robot record {name}: {normalized.model_dump(mode='json')}")
+    return normalized
+
+
 def save_robot_record(name: str, data: dict, allow_create: bool = True) -> bool:
     """
     Upsert a robot record. Merges `data` into the existing record, preserving
@@ -400,24 +801,10 @@ def save_robot_record(name: str, data: dict, allow_create: bool = True) -> bool:
         logger.error(f"Invalid robot name: {name!r}")
         return False
 
-    os.makedirs(ROBOTS_PATH, exist_ok=True)
-    existing = get_robot_record(name)
-    if existing is None and not allow_create:
+    record = save_robot_record_v2(name, data, allow_create=allow_create)
+    if record is None:
         logger.info(f"save_robot_record no-op: {name} does not exist (allow_create=False)")
         return False
-
-    record = existing if existing is not None else _empty_record(name)
-    for field in _ROBOT_STRING_FIELDS:
-        if field in data and isinstance(data[field], str):
-            record[field] = data[field]
-    for field in _ROBOT_LIST_FIELDS:
-        if field in data and isinstance(data[field], list):
-            record[field] = data[field]
-    record["name"] = name
-
-    path = _robot_record_path(name)
-    _atomic_write_text(path, json.dumps(record, indent=2))
-    logger.info(f"Saved robot record {name}: {record}")
     return True
 
 
@@ -433,12 +820,30 @@ def delete_robot_record(name: str) -> bool:
     return True
 
 
-def is_robot_record_clean(record: dict) -> bool:
+def is_robot_record_clean(record: RobotRecordV2 | Mapping[str, Any]) -> bool:
     """
     A record is 'clean' when all four operational fields are populated AND both
     referenced calibration files exist on disk. Cameras are optional and don't
     affect cleanliness.
     """
+    if isinstance(record, RobotRecordV2) or (
+        isinstance(record, Mapping) and set(record) & _V2_ONLY_RECORD_FIELDS
+    ):
+        try:
+            normalized = (
+                record
+                if isinstance(record, RobotRecordV2)
+                else normalize_robot_record(str(record.get("name", "")), record)
+            )
+        except RobotRecordValidationError:
+            return False
+        operation = (
+            RobotOperation.LEADER_TELEOPERATION
+            if normalized.teleoperator_type == "leader_arm"
+            else RobotOperation.STADIA_TELEOPERATION
+        )
+        return evaluate_robot_readiness(normalized, operation).ready
+
     if not record:
         return False
     for field in _ROBOT_STRING_FIELDS:
@@ -448,3 +853,116 @@ def is_robot_record_clean(record: dict) -> bool:
     leader_path = os.path.join(LEADER_CONFIG_PATH, record["leader_config"])
     follower_path = os.path.join(FOLLOWER_CONFIG_PATH, record["follower_config"])
     return os.path.exists(leader_path) and os.path.exists(follower_path)
+
+
+def _missing_issue(side: str, field: str) -> ReadinessIssue:
+    label = side.capitalize()
+    return ReadinessIssue(
+        code=f"{side}_{field}_missing",
+        field=f"{side}.{'calibration' if field == 'calibration' else 'port'}",
+        message=f"{label} {field} is required.",
+    )
+
+
+def _device_issues(
+    side: Literal["leader", "follower"],
+    device: DeviceRecord | None,
+    *,
+    require_existing_calibration: bool,
+) -> list[ReadinessIssue]:
+    if device is None:
+        return [
+            ReadinessIssue(
+                code=f"{side}_configuration_missing",
+                field=side,
+                message=f"{side.capitalize()} configuration is required.",
+            )
+        ]
+
+    issues = []
+    if not device.port.strip():
+        issues.append(_missing_issue(side, "port"))
+    if not device.calibration.strip():
+        issues.append(_missing_issue(side, "calibration"))
+    elif require_existing_calibration:
+        directory = LEADER_CONFIG_PATH if side == "leader" else FOLLOWER_CONFIG_PATH
+        if not os.path.isfile(os.path.join(directory, device.calibration)):
+            issues.append(
+                ReadinessIssue(
+                    code=f"{side}_calibration_not_found",
+                    field=f"{side}.calibration",
+                    message=f"{side.capitalize()} calibration file was not found.",
+                )
+            )
+    return issues
+
+
+def evaluate_robot_readiness(
+    record: RobotRecordV2 | Mapping[str, Any],
+    operation: RobotOperation | str,
+) -> ReadinessResult:
+    """Evaluate static, operation-specific readiness without device access."""
+    if not isinstance(record, RobotRecordV2):
+        record = normalize_robot_record(str(record.get("name", "")), record)
+    try:
+        selected_operation = RobotOperation(operation)
+    except ValueError as error:
+        raise ValueError(f"unknown robot operation: {operation!r}") from error
+
+    required_type: str | None = None
+    if selected_operation in {
+        RobotOperation.LEADER_CALIBRATION,
+        RobotOperation.LEADER_TELEOPERATION,
+        RobotOperation.LEADER_RECORDING,
+    }:
+        required_type = "leader_arm"
+    elif selected_operation in {
+        RobotOperation.STADIA_TELEOPERATION,
+        RobotOperation.STADIA_RECORDING,
+        RobotOperation.CONTROLLER_CHECK,
+    }:
+        required_type = "stadia"
+
+    if required_type is not None and record.teleoperator_type != required_type:
+        issue = ReadinessIssue(
+            code="wrong_teleoperator_type",
+            field="teleoperator_type",
+            message=f"Operation requires teleoperator_type={required_type!r}.",
+        )
+        return ReadinessResult(operation=selected_operation, ready=False, issues=(issue,))
+
+    issues: list[ReadinessIssue] = []
+    if selected_operation == RobotOperation.FOLLOWER_CALIBRATION:
+        issues.extend(_device_issues("follower", record.follower, require_existing_calibration=False))
+    elif selected_operation == RobotOperation.LEADER_CALIBRATION:
+        issues.extend(_device_issues("leader", record.leader, require_existing_calibration=False))
+    elif selected_operation in {
+        RobotOperation.LEADER_TELEOPERATION,
+        RobotOperation.LEADER_RECORDING,
+    }:
+        issues.extend(_device_issues("leader", record.leader, require_existing_calibration=True))
+        issues.extend(_device_issues("follower", record.follower, require_existing_calibration=True))
+    elif selected_operation in {
+        RobotOperation.STADIA_TELEOPERATION,
+        RobotOperation.STADIA_RECORDING,
+        RobotOperation.INFERENCE,
+        RobotOperation.REPLAY,
+    }:
+        issues.extend(_device_issues("follower", record.follower, require_existing_calibration=True))
+    elif selected_operation == RobotOperation.CONTROLLER_CHECK:
+        # Pydantic has already validated Stadia settings. Runtime exclusivity is
+        # added later by the central session manager, never by touching a robot.
+        pass
+
+    return ReadinessResult(
+        operation=selected_operation,
+        ready=not issues,
+        issues=tuple(issues),
+    )
+
+
+def evaluate_all_robot_readiness(
+    record: RobotRecordV2 | Mapping[str, Any],
+) -> dict[str, ReadinessResult]:
+    """Return the normalized static readiness result for every operation."""
+    return {operation.value: evaluate_robot_readiness(record, operation) for operation in RobotOperation}

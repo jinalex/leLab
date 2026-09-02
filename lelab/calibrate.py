@@ -19,6 +19,7 @@ This module provides calibration functionality similar to the CLI calibrate.py,
 but adapted for the web interface with step-by-step guidance.
 """
 
+import copy
 import logging
 import threading
 import time
@@ -38,7 +39,7 @@ from lerobot.teleoperators import (
 )
 from lerobot.utils.utils import init_logging
 
-from .utils.devices import safe_disconnect_device
+from .utils.devices import DeviceCleanupError, safe_disconnect_device
 
 logger = logging.getLogger(__name__)
 
@@ -88,6 +89,7 @@ class CalibrationStatus:
     total_steps: int = 1  # Total number of calibration steps
     current_positions: dict[str, float] = None
     recorded_ranges: dict[str, dict[str, float]] = None  # {motor: {min: val, max: val, current: val}}
+    cleanup_pending: bool = False
 
 
 @dataclass
@@ -116,57 +118,20 @@ class CalibrationManager:
         self._maxes = {}
         self._homing_offsets = {}
         self._current_request: CalibrationRequest | None = None
+        self._cleanup_error: str | None = None
 
         # Initialize logging
         init_logging()
 
     def get_status(self) -> CalibrationStatus:
-        """Get current calibration status"""
+        """Return a copied status snapshot without touching the device bus.
+
+        The calibration worker is the sole bus reader while it owns the device.
+        Keeping this accessor passive prevents HTTP polling from racing the
+        worker's 20 Hz range-recording reads on the serial port.
+        """
         with self._status_lock:
-            # Update current positions if we're recording and device is connected
-            if self.status.status == "recording" and self.device and self.device.is_connected:
-                try:
-                    # Try reading positions with quick retry on port contention
-                    positions = None
-                    for attempt in range(2):  # Quick retry for status updates
-                        try:
-                            positions = self.device.bus.sync_read("Present_Position", normalize=False)
-                            break
-                        except Exception as read_error:
-                            if "Port is in use" in str(read_error) and attempt < 1:
-                                time.sleep(0.005)  # Very short delay
-                                continue
-                            else:
-                                raise read_error
-
-                    if positions:
-                        # Update recorded ranges
-                        if not self.status.recorded_ranges:
-                            self.status.recorded_ranges = {}
-
-                        for motor, pos in positions.items():
-                            # Filter out invalid readings (0, negative, or extreme values)
-                            if not _is_valid_position(pos):
-                                continue  # Skip invalid readings
-
-                            if motor not in self.status.recorded_ranges:
-                                self.status.recorded_ranges[motor] = {"min": pos, "max": pos, "current": pos}
-                            else:
-                                self.status.recorded_ranges[motor]["current"] = pos
-                                self.status.recorded_ranges[motor]["min"] = min(
-                                    self.status.recorded_ranges[motor]["min"], pos
-                                )
-                                self.status.recorded_ranges[motor]["max"] = max(
-                                    self.status.recorded_ranges[motor]["max"], pos
-                                )
-                except Exception as e:
-                    # Reduce log spam by using debug level for expected port contention
-                    if "Port is in use" in str(e):
-                        logger.debug(f"Port busy during position read: {e}")
-                    else:
-                        logger.warning(f"Failed to read positions: {e}")
-
-            return self.status
+            return copy.deepcopy(self.status)
 
     def _update_status(self, **kwargs):
         """Update calibration status thread-safely"""
@@ -186,6 +151,7 @@ class CalibrationManager:
             self._mins = {}
             self._maxes = {}
             self._homing_offsets = {}
+            self._cleanup_error = None
 
             self._update_status(
                 calibration_active=True,
@@ -196,6 +162,7 @@ class CalibrationManager:
                 step=0,
                 current_positions=None,
                 recorded_ranges=None,
+                cleanup_pending=False,
             )
             self._current_request = request
 
@@ -236,9 +203,14 @@ class CalibrationManager:
             return {"success": False, "message": str(e)}
 
     def stop_calibration_process(self) -> dict[str, Any]:
-        """Stop calibration process"""
+        """Signal the calibration worker and wait boundedly for its cleanup.
+
+        This request-thread method never disconnects the device. The worker's
+        ``finally`` block is the sole cleanup owner, including when this join
+        times out or raises.
+        """
         try:
-            if not self.status.calibration_active:
+            if not self.get_status().calibration_active:
                 return {"success": False, "message": "No calibration active"}
 
             logger.info("Stopping calibration process...")
@@ -252,24 +224,56 @@ class CalibrationManager:
             if self.calibration_thread and self.calibration_thread.is_alive():
                 self.calibration_thread.join(timeout=5.0)
 
-            # Ensure cleanup is called if thread didn't finish properly
             if self.calibration_thread and self.calibration_thread.is_alive():
-                logger.warning("Calibration thread did not finish within timeout, forcing cleanup")
+                logger.warning(
+                    "Calibration thread did not finish within timeout; cleanup remains worker-owned"
+                )
+                return {
+                    "success": False,
+                    "message": "Calibration stop requested, but the worker is still shutting down",
+                    "stop_pending": True,
+                    "cleanup_proven": False,
+                }
 
-            # Force cleanup and finish
-            self._cleanup_and_finish("Calibration stopped", status="idle")
+            terminal = self.get_status()
+            if terminal.calibration_active:
+                logger.error("Calibration worker exited without publishing a terminal status")
+                return {
+                    "success": False,
+                    "message": "Calibration worker exited without confirming cleanup",
+                    "stop_pending": True,
+                    "cleanup_proven": False,
+                }
+
+            if terminal.status == "error":
+                return {
+                    "success": False,
+                    "message": terminal.error or terminal.message,
+                    "stop_pending": terminal.cleanup_pending,
+                    "cleanup_proven": not terminal.cleanup_pending,
+                }
 
             logger.info("Calibration stop completed")
-            return {"success": True, "message": "Calibration stopped"}
+            return {
+                "success": True,
+                "message": "Calibration stopped",
+                "cleanup_proven": True,
+            }
 
         except Exception as e:
             logger.error(f"Error stopping calibration: {e}")
-            # Force cleanup on error too
-            self._cleanup_and_finish("Calibration stopped with error", status="error")
-            return {"success": False, "message": str(e)}
+            return {
+                "success": False,
+                "message": str(e),
+                "stop_pending": True,
+                "cleanup_proven": False,
+            }
 
     def _calibration_worker(self, request: CalibrationRequest):
         """Worker thread for calibration process"""
+        terminal_message = "Calibration completed successfully"
+        terminal_status = "completed"
+        terminal_error: str | None = None
         try:
             logger.info(f"Starting calibration worker for {request.device_type}")
 
@@ -298,7 +302,8 @@ class CalibrationManager:
 
             if self.stop_calibration:
                 logger.info("Calibration stopped after device connection")
-                self._cleanup_and_finish("Calibration cancelled")
+                terminal_message = "Calibration cancelled"
+                terminal_status = "idle"
                 return
 
             # Start Step 1: Homing
@@ -306,7 +311,8 @@ class CalibrationManager:
 
             if self.stop_calibration:
                 logger.info("Calibration stopped after homing step")
-                self._cleanup_and_finish("Calibration cancelled")
+                terminal_message = "Calibration cancelled"
+                terminal_status = "idle"
                 return
 
             # Start Step 2: Range Recording
@@ -314,32 +320,36 @@ class CalibrationManager:
 
             if self.stop_calibration:
                 logger.info("Calibration stopped after recording step")
-                self._cleanup_and_finish("Calibration cancelled")
+                terminal_message = "Calibration cancelled"
+                terminal_status = "idle"
                 return
 
             # Complete calibration
             self._complete_calibration()
 
             logger.info("Calibration completed successfully")
-            self._cleanup_and_finish("Calibration completed successfully", status="completed")
 
         except CalibrationDiscontinuityError as e:
             logger.error(f"Calibration discontinuity: {e}")
-            self._update_status(error=str(e))
-            self._cleanup_and_finish(str(e), status="error")
+            terminal_message = str(e)
+            terminal_status = "error"
+            terminal_error = str(e)
         except Exception as e:
             logger.error(f"Calibration error: {e}")
             logger.error(traceback.format_exc())
-            # Ensure cleanup happens even on error
-            self._cleanup_and_finish(f"Calibration failed: {e}", status="error")
+            terminal_message = f"Calibration failed: {e}"
+            terminal_status = "error"
+            terminal_error = str(e)
         finally:
-            # Ensure we always clean up and reset the active flag
             logger.info("Calibration worker thread finishing")
-            if self.status.calibration_active:
-                logger.warning(
-                    "Worker thread ending but calibration still marked as active - forcing cleanup"
-                )
-                self._cleanup_and_finish("Calibration stopped", status="idle")
+            if self.stop_calibration and terminal_status == "completed":
+                terminal_message = "Calibration cancelled"
+                terminal_status = "idle"
+            self._cleanup_and_finish(
+                terminal_message,
+                status=terminal_status,
+                error=terminal_error,
+            )
 
     def _step_homing(self):
         """Auto-capture homing offsets from the device's current position."""
@@ -399,6 +409,7 @@ class CalibrationManager:
             status="recording",
             step=1,
             message="Move ALL joints through their FULL ranges of motion - from minimum to maximum positions. Ensure each joint moves significantly from its starting position.",
+            current_positions=dict(self._start_positions),
             recorded_ranges={
                 motor: {"min": pos, "max": pos, "current": pos}
                 for motor, pos in self._start_positions.items()
@@ -450,6 +461,20 @@ class CalibrationManager:
                             if motor in self._mins:
                                 self._mins[motor] = min(self._mins[motor], pos)
                                 self._maxes[motor] = max(self._maxes[motor], pos)
+
+                        # Publish one coherent snapshot from the worker-owned
+                        # serial read. Status polling only copies these values.
+                        self._update_status(
+                            current_positions=dict(prev_positions),
+                            recorded_ranges={
+                                motor: {
+                                    "min": self._mins[motor],
+                                    "max": self._maxes[motor],
+                                    "current": prev_positions[motor],
+                                }
+                                for motor in self._mins
+                            },
+                        )
 
                 time.sleep(0.05)  # 20Hz update rate
             except CalibrationDiscontinuityError:
@@ -543,23 +568,86 @@ class CalibrationManager:
             except Exception as e:
                 logger.warning(f"Robot-record write-back failed for {request.robot_name}: {e}")
 
-    def _cleanup_and_finish(self, message: str, status: str = "completed"):
+    def _cleanup_and_finish(
+        self,
+        message: str,
+        status: str = "completed",
+        error: str | None = None,
+    ):
         """Clean up and finish calibration"""
-        self._cleanup_device()
         self._recording_active = False
-        self._update_status(calibration_active=False, status=status, message=message)
+        cleanup_proven = self._cleanup_device()
+        if not cleanup_proven:
+            cleanup_error = self._cleanup_error or "Calibration device cleanup could not be verified"
+            if error:
+                cleanup_error = f"{error}; {cleanup_error}"
+            # Fail closed: retain the device reference and active ownership so
+            # the shared coordinator cannot hand the serial resource to a new
+            # operation after an unproven disconnect.
+            self._update_status(
+                calibration_active=True,
+                status="error",
+                error=cleanup_error,
+                message=cleanup_error,
+                cleanup_pending=True,
+            )
+            return
+        if self._cleanup_error:
+            error = f"{error}; {self._cleanup_error}" if error else self._cleanup_error
+            message = error
+            status = "error"
+        self._update_status(
+            calibration_active=False,
+            status=status,
+            error=error,
+            message=message,
+            cleanup_pending=False,
+        )
 
-    def _cleanup_device(self):
+    def _cleanup_device(self) -> bool:
         """Clean up device connection.
 
         Uses safe_disconnect_device so a failed disconnect (flaky USB/serial)
         force-releases the port/cameras instead of leaving the device busy and
         blocking the next calibration/teleop/record run.
         """
-        if self.device:
-            logger.info("Disconnecting device...")
-            safe_disconnect_device(self.device, logger, context="calibration cleanup")
-            self.device = None
+        device = self.device
+        if device is None:
+            return True
+
+        logger.info("Disconnecting device...")
+        try:
+            safe_disconnect_device(device, logger, context="calibration cleanup")
+        except DeviceCleanupError as exc:
+            logger.error("Calibration device cleanup failed: %s", exc)
+            self._cleanup_error = str(exc)
+            if exc.cleanup_proven:
+                self.device = None
+            return exc.cleanup_proven
+        except Exception as exc:
+            logger.error("Calibration device cleanup failed unexpectedly: %s", exc)
+            self._cleanup_error = str(exc)
+            return False
+
+        # LeRobot's SO-101 wrappers expose `is_connected`; its bus fallback is
+        # useful for narrow fakes and compatible wrappers. If a postcondition
+        # exists, require it to say disconnected. An unreadable or still-true
+        # postcondition is unproven cleanup and must retain ownership.
+        sentinel = object()
+        try:
+            connected: object = getattr(device, "is_connected", sentinel)
+            if connected is sentinel:
+                connected = getattr(getattr(device, "bus", None), "is_connected", sentinel)
+            if connected is not False:
+                logger.error("Calibration device disconnect postcondition is not exact false")
+                return False
+        except Exception as exc:
+            logger.error("Could not verify calibration device cleanup: %s", exc)
+            return False
+
+        self.device = None
+        self._cleanup_error = None
+        return True
 
 
 # Global calibration manager instance

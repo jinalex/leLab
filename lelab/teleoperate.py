@@ -24,7 +24,7 @@ from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
 
 from .utils.config import setup_calibration_files
-from .utils.devices import safe_disconnect_device
+from .utils.devices import DeviceCleanupError, safe_disconnect_device
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,9 @@ teleoperation_active = False
 teleoperation_thread: threading.Thread | None = None
 current_robot = None
 current_teleop = None
+# Stable terminal evidence retained until the next start. The shared control
+# coordinator polls through handle_teleoperation_status after the worker exits.
+_teleoperation_terminal_status: dict[str, Any] | None = None
 # Guards the start path; the worker owns disconnect so stop() does not race.
 _state_lock = threading.Lock()
 
@@ -99,13 +102,34 @@ def get_joint_positions_from_robot(robot) -> dict[str, float]:
         return dict.fromkeys(motor_to_urdf_mapping.values(), 0.0)
 
 
-def _safe_disconnect(device) -> None:
-    """Disconnect a robot/teleop device, swallowing (but logging) any error.
+def _safe_disconnect(device) -> tuple[str | None, bool]:
+    """Disconnect one device and return truthful teardown error evidence.
 
-    Used on the connection-failure cleanup path so one device's failure can't
-    leave the other holding its serial port open.
+    Used on both worker and connection-failure cleanup paths. The shared helper
+    best-efforts every resource before raising; converting that exception to a
+    string here lets us still attempt the other arm and retain one aggregate
+    terminal status for the coordinator.
     """
-    safe_disconnect_device(device, logger)
+    if device is None:
+        return None, True
+    try:
+        safe_disconnect_device(device, logger, context="teleoperation cleanup")
+    except DeviceCleanupError as exc:
+        logger.error("Teleoperation cleanup failed: %s", exc)
+        return str(exc), exc.cleanup_proven
+    except Exception as exc:
+        logger.error("Teleoperation cleanup failed unexpectedly: %s", exc)
+        return str(exc), False
+    return None, True
+
+
+def _cleanup_result(device) -> tuple[str | None, bool]:
+    """Normalize the historical no-result cleanup hook used by integrations."""
+
+    result = _safe_disconnect(device)
+    if result is None:
+        return None, True
+    return result
 
 
 def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=None) -> dict[str, Any]:
@@ -117,17 +141,24 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
     success. Only the teleoperation loop runs in the background thread.
     """
     global teleoperation_active, teleoperation_thread, current_robot, current_teleop
+    global _teleoperation_terminal_status
 
     from . import record as _record, rollout as _rollout
 
     with _state_lock:
         if teleoperation_active:
             return {"success": False, "message": "Teleoperation is already active"}
+        if _teleoperation_terminal_status and _teleoperation_terminal_status.get("cleanup_pending"):
+            return {
+                "success": False,
+                "message": "Previous teleoperation cleanup is unproven; restart LeLab before retrying",
+            }
         if _record.recording_active:
             return {"success": False, "message": "Recording is currently active. Stop it first."}
         if _rollout.inference_active:
             return {"success": False, "message": "Inference is currently active. Stop it first."}
         teleoperation_active = True
+        _teleoperation_terminal_status = None
 
     robot = None
     teleop_device = None
@@ -199,8 +230,10 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
         # does not race the serial bus from the request thread.
         def teleoperation_worker():
             global teleoperation_active, current_robot, current_teleop
+            global _teleoperation_terminal_status
 
             logger.info("Starting teleoperation loop...")
+            terminal_error: str | None = None
             try:
                 last_broadcast_time = 0
                 broadcast_interval = 0.05  # 20 FPS
@@ -227,13 +260,29 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
                     time.sleep(0.001)
             except Exception as e:
                 logger.error(f"Error during teleoperation loop: {e}")
+                terminal_error = str(e)
             finally:
-                _safe_disconnect(robot)
-                _safe_disconnect(teleop_device)
+                robot_cleanup = _cleanup_result(robot)
+                teleop_cleanup = _cleanup_result(teleop_device)
+                cleanup_results = (robot_cleanup, teleop_cleanup)
+                cleanup_errors = [error for error, _proven in cleanup_results if error is not None]
+                cleanup_pending = not all(proven for _error, proven in cleanup_results)
+                if cleanup_errors:
+                    cleanup_detail = "; ".join(cleanup_errors)
+                    terminal_error = (
+                        f"{terminal_error}; {cleanup_detail}" if terminal_error else cleanup_detail
+                    )
                 logger.info("Teleoperation stopped")
-                teleoperation_active = False
-                current_robot = None
-                current_teleop = None
+                with _state_lock:
+                    teleoperation_active = False
+                    current_robot = robot if not robot_cleanup[1] else None
+                    current_teleop = teleop_device if not teleop_cleanup[1] else None
+                    _teleoperation_terminal_status = {
+                        "exited": True,
+                        "outcome": "failed" if terminal_error else "stopped",
+                        "error": terminal_error,
+                        "cleanup_pending": cleanup_pending,
+                    }
 
         teleoperation_thread = threading.Thread(
             target=teleoperation_worker, name="teleoperation-worker", daemon=True
@@ -250,11 +299,24 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
     except Exception as e:
         # Connection (or setup) failed before the loop started: release any
         # device that did open, reset state, and surface the error.
-        _safe_disconnect(robot)
-        _safe_disconnect(teleop_device)
+        robot_cleanup = _cleanup_result(robot)
+        teleop_cleanup = _cleanup_result(teleop_device)
+        cleanup_results = (robot_cleanup, teleop_cleanup)
+        cleanup_errors = [error for error, _proven in cleanup_results if error is not None]
+        cleanup_pending = not all(proven for _error, proven in cleanup_results)
+        terminal_error = str(e)
+        if cleanup_errors:
+            terminal_error = f"{terminal_error}; {'; '.join(cleanup_errors)}"
         teleoperation_active = False
-        current_robot = None
-        current_teleop = None
+        current_robot = robot if not robot_cleanup[1] else None
+        current_teleop = teleop_device if not teleop_cleanup[1] else None
+        with _state_lock:
+            _teleoperation_terminal_status = {
+                "exited": True,
+                "outcome": "failed",
+                "error": terminal_error,
+                "cleanup_pending": cleanup_pending,
+            }
         logger.error(f"Failed to start teleoperation: {e}")
         # str(e) is already a user-facing message for the connection failures
         # raised above; the toast title supplies the "error starting" context.
@@ -281,20 +343,56 @@ def handle_stop_teleoperation() -> dict[str, Any]:
         worker.join(timeout=5.0)
         if worker.is_alive():
             logger.warning("Teleoperation worker did not exit within 5s")
+            return {
+                "success": False,
+                "message": "Teleoperation stop requested, but the worker is still shutting down",
+                "stop_pending": True,
+                "cleanup_proven": False,
+            }
     teleoperation_thread = None
 
-    return {"success": True, "message": "Teleoperation stopped successfully"}
+    terminal = handle_teleoperation_status()
+    if terminal.get("outcome") == "failed":
+        cleanup_proven = not bool(terminal.get("cleanup_pending"))
+        return {
+            "success": False,
+            "message": str(terminal.get("error") or "Teleoperation ended with an error"),
+            "stop_pending": not cleanup_proven,
+            "cleanup_proven": cleanup_proven,
+        }
+
+    return {
+        "success": True,
+        "message": "Teleoperation stopped successfully",
+        "cleanup_proven": True,
+    }
 
 
 def handle_teleoperation_status() -> dict[str, Any]:
     """Handle teleoperation status request"""
-    return {
-        "teleoperation_active": teleoperation_active,
+    with _state_lock:
+        active = teleoperation_active
+        terminal = dict(_teleoperation_terminal_status) if _teleoperation_terminal_status else None
+        worker = teleoperation_thread
+
+    worker_alive = bool(worker is not None and worker.is_alive())
+
+    result = {
+        "teleoperation_active": active,
         "available_controls": {
-            "stop_teleoperation": teleoperation_active,
+            "stop_teleoperation": active,
         },
         "message": "Teleoperation status retrieved successfully",
     }
+    if active:
+        result.update({"exited": False, "outcome": "running", "error": None, "cleanup_pending": False})
+    elif worker_alive:
+        result.update({"exited": False, "outcome": "stopping", "error": None, "cleanup_pending": True})
+    elif terminal is not None:
+        result.update(terminal)
+    else:
+        result.update({"exited": False, "outcome": "idle", "error": None, "cleanup_pending": False})
+    return result
 
 
 def handle_get_joint_positions() -> dict[str, Any]:

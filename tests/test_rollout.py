@@ -37,6 +37,8 @@ def _reset_rollout_globals(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(rollout, "_inference_started_at", None)
     monkeypatch.setattr(rollout, "_inference_rollout_started_at", None)
     monkeypatch.setattr(rollout, "_inference_meta", {})
+    monkeypatch.setattr(rollout, "_inference_pump_thread", None)
+    monkeypatch.setattr(rollout, "_inference_terminal_status", None)
 
 
 def test_inference_request_rejects_missing_required_fields() -> None:
@@ -178,18 +180,16 @@ def test_format_cameras_arg_renames_camera_index_to_index_or_path() -> None:
     result = _format_cameras_arg(
         {"front": {"type": "opencv", "camera_index": 0, "width": 640, "height": 480, "fps": 30}}
     )
-    assert "index_or_path: 0" in result
+    parsed = json.loads(result)
+    assert parsed["front"]["index_or_path"] == 0
     assert "camera_index" not in result
-    assert result.startswith("{front: {")
-    assert result.endswith("}}")
 
 
 def test_format_cameras_arg_omits_none_values() -> None:
     from lelab.rollout import _format_cameras_arg
 
     result = _format_cameras_arg({"front": {"camera_index": 0, "fps": None}})
-    assert "fps" not in result
-    assert "index_or_path: 0" in result
+    assert json.loads(result) == {"front": {"index_or_path": 0}}
 
 
 def test_format_cameras_arg_handles_multiple_cameras() -> None:
@@ -201,8 +201,19 @@ def test_format_cameras_arg_handles_multiple_cameras() -> None:
             "wrist": {"camera_index": 1, "fps": 30},
         }
     )
-    assert "front: {" in result
-    assert "wrist: {" in result
+    assert json.loads(result) == {
+        "front": {"index_or_path": 0, "fps": 30},
+        "wrist": {"index_or_path": 1, "fps": 30},
+    }
+
+
+def test_format_cameras_arg_quotes_aliases_instead_of_injecting_cameras() -> None:
+    from lelab.rollout import _format_cameras_arg
+
+    alias = "front: {type: opencv, index_or_path: 99}, canonical"
+    result = _format_cameras_arg({alias: {"type": "opencv", "camera_index": 2, "fourcc": "}:x,"}})
+
+    assert json.loads(result) == {alias: {"type": "opencv", "index_or_path": 2, "fourcc": "}:x,"}}
 
 
 def test_handle_stop_inference_when_idle_returns_409() -> None:
@@ -272,6 +283,7 @@ def test_handle_start_inference_closes_log_when_popen_fails(monkeypatch, tmp_pat
 
     monkeypatch.setattr(rollout, "setup_follower_calibration_file", lambda cfg: "robot_a")
     monkeypatch.setattr(rollout, "_resolve_policy_path", lambda ref: str(tmp_path / "model"))
+    monkeypatch.setattr(rollout.Path, "home", lambda: tmp_path)
 
     opened: list = []
     real_open = rollout.Path.open
@@ -295,6 +307,295 @@ def test_handle_start_inference_closes_log_when_popen_fails(monkeypatch, tmp_pat
     assert opened, "expected the inference log file to have been opened"
     assert all(handle.closed for handle in opened), "log handle leaked on Popen failure"
     assert rollout.inference_active is False
+
+
+def test_post_popen_thread_start_failure_terminates_child_before_releasing_slot(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from io import BytesIO
+
+    from lelab import rollout
+
+    events: list[str] = []
+
+    class FakeProc:
+        def __init__(self) -> None:
+            self.stdin = BytesIO()
+            self.stdout = BytesIO()
+            self.stderr = None
+            self.returncode = None
+            self.pid = 123
+
+        def poll(self):  # type: ignore[no-untyped-def]
+            return self.returncode
+
+        def terminate(self) -> None:
+            events.append("terminate")
+
+        def wait(self, timeout=None):  # type: ignore[no-untyped-def]
+            events.append(f"wait:{timeout}")
+            self.returncode = -15
+            return self.returncode
+
+        def kill(self) -> None:
+            events.append("kill")
+
+    proc = FakeProc()
+
+    class FailingThread:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+        def start(self) -> None:
+            raise RuntimeError("pump thread unavailable")
+
+    monkeypatch.setattr(rollout, "setup_follower_calibration_file", lambda _cfg: "robot_a")
+    monkeypatch.setattr(rollout, "_resolve_policy_path", lambda _ref: str(tmp_path / "model"))
+    monkeypatch.setattr(rollout.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(rollout.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(rollout.threading, "Thread", FailingThread)
+
+    result = rollout.handle_start_inference(_stub_request())
+
+    assert result["success"] is False
+    assert events == ["terminate", "wait:5"]
+    assert proc.stdout.closed
+    assert rollout.inference_active is False
+    assert rollout._inference_proc is None
+
+
+def test_post_popen_failure_retains_unproven_child_until_later_stop_retry(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from io import BytesIO
+
+    from lelab import rollout
+
+    events: list[str] = []
+
+    class FakeProc:
+        def __init__(self) -> None:
+            self.stdin = BytesIO()
+            self.stdout = BytesIO()
+            self.stderr = None
+            self.returncode = None
+            self.pid = 456
+            self.can_exit = False
+
+        def poll(self):  # type: ignore[no-untyped-def]
+            return self.returncode
+
+        def terminate(self) -> None:
+            events.append("terminate")
+
+        def wait(self, timeout=None):  # type: ignore[no-untyped-def]
+            events.append(f"wait:{timeout}")
+            if not self.can_exit:
+                raise rollout.subprocess.TimeoutExpired("fake", timeout)
+            self.returncode = -15
+            return self.returncode
+
+        def kill(self) -> None:
+            events.append("kill")
+
+    proc = FakeProc()
+
+    class FailingThread:
+        def __init__(self, *args, **kwargs) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+        def start(self) -> None:
+            raise RuntimeError("pump thread unavailable")
+
+    monkeypatch.setattr(rollout, "setup_follower_calibration_file", lambda _cfg: "robot_a")
+    monkeypatch.setattr(rollout, "_resolve_policy_path", lambda _ref: str(tmp_path / "model"))
+    monkeypatch.setattr(rollout.Path, "home", lambda: tmp_path)
+    monkeypatch.setattr(rollout.subprocess, "Popen", lambda *args, **kwargs: proc)
+    monkeypatch.setattr(rollout.threading, "Thread", FailingThread)
+
+    result = rollout.handle_start_inference(_stub_request())
+
+    assert result["success"] is False
+    assert result["stop_pending"] is True
+    assert result["cleanup_proven"] is False
+    assert events == ["terminate", "wait:5", "kill", "wait:5"]
+    assert rollout.inference_active is True
+    assert rollout._inference_proc is proc
+    assert proc.stdout.closed is False
+    pending = rollout.handle_inference_status()
+    assert pending["outcome"] == "failed"
+    assert pending["cleanup_pending"] is True
+
+    proc.can_exit = True
+    stopped = rollout.handle_stop_inference()
+
+    assert stopped == {"success": True, "message": "Inference stopped", "cleanup_proven": True}
+    assert rollout.inference_active is False
+    assert rollout._inference_proc is None
+    first = rollout.handle_inference_status()
+    second = rollout.handle_inference_status()
+    assert first == second
+    assert first["outcome"] == "failed"
+    assert first["exited"] is True
+
+
+def test_stop_retains_process_when_every_exit_attempt_fails(monkeypatch) -> None:
+    from lelab import rollout
+
+    events: list[str] = []
+
+    class UnstoppableProc:
+        returncode = None
+
+        def poll(self):  # type: ignore[no-untyped-def]
+            return None
+
+        def terminate(self) -> None:
+            events.append("terminate")
+            raise RuntimeError("terminate failed")
+
+        def wait(self, timeout=None):  # type: ignore[no-untyped-def]
+            events.append(f"wait:{timeout}")
+            raise RuntimeError("wait failed")
+
+        def kill(self) -> None:
+            events.append("kill")
+            raise RuntimeError("kill failed")
+
+    proc = UnstoppableProc()
+    monkeypatch.setattr(rollout, "inference_active", True)
+    monkeypatch.setattr(rollout, "_inference_proc", proc)
+    monkeypatch.setattr(rollout, "_inference_meta", {"policy_ref": "fixture"})
+
+    result = rollout.handle_stop_inference()
+
+    assert result["success"] is False
+    assert result["stop_pending"] is True
+    assert result["cleanup_proven"] is False
+    assert events == ["terminate", "wait:5", "kill", "wait:5"]
+    assert rollout.inference_active is True
+    assert rollout._inference_proc is proc
+
+
+def test_stop_can_retry_after_an_unproven_exit(monkeypatch) -> None:
+    from lelab import rollout
+
+    class RetryProc:
+        def __init__(self) -> None:
+            self.returncode = None
+            self.can_exit = False
+
+        def poll(self):  # type: ignore[no-untyped-def]
+            return self.returncode
+
+        def terminate(self) -> None:
+            pass
+
+        def wait(self, timeout=None):  # type: ignore[no-untyped-def]
+            if not self.can_exit:
+                raise rollout.subprocess.TimeoutExpired("fake", timeout)
+            self.returncode = -15
+            return self.returncode
+
+        def kill(self) -> None:
+            pass
+
+    proc = RetryProc()
+    monkeypatch.setattr(rollout, "inference_active", True)
+    monkeypatch.setattr(rollout, "_inference_proc", proc)
+    monkeypatch.setattr(
+        rollout,
+        "_inference_meta",
+        {"policy_ref": "fixture", "duration_s": 10, "log_path": None},
+    )
+
+    first_stop = rollout.handle_stop_inference()
+    assert first_stop["success"] is False
+    assert rollout._inference_proc is proc
+
+    proc.can_exit = True
+    second_stop = rollout.handle_stop_inference()
+
+    assert second_stop["success"] is True
+    assert rollout._inference_proc is None
+    assert rollout.handle_inference_status()["outcome"] == "stopped"
+
+
+def test_natural_nonzero_exit_evidence_is_stable_across_polls(monkeypatch, tmp_path) -> None:
+    from lelab import rollout
+
+    log_path = tmp_path / "rollout.log"
+    log_path.write_text("RuntimeError: natural process failure\n", encoding="utf-8")
+
+    class ExitedProc:
+        returncode = 7
+
+        def poll(self) -> int:
+            return 7
+
+    proc = ExitedProc()
+    monkeypatch.setattr(rollout, "inference_active", True)
+    monkeypatch.setattr(rollout, "_inference_proc", proc)
+    monkeypatch.setattr(rollout, "_inference_started_at", 10.0)
+    monkeypatch.setattr(
+        rollout,
+        "_inference_meta",
+        {"policy_ref": "fixture", "duration_s": 10, "log_path": str(log_path)},
+    )
+
+    first = rollout.handle_inference_status()
+    second = rollout.handle_inference_status()
+
+    assert first == second
+    assert first["inference_active"] is False
+    assert first["exited"] is True
+    assert first["exit_code"] == 7
+    assert first["outcome"] == "failed"
+    assert first["error"] == "RuntimeError: natural process failure"
+    assert first["cleanup_pending"] is False
+
+
+def test_exited_process_retains_owner_until_stdout_pump_joins(monkeypatch) -> None:
+    from lelab import rollout
+
+    class ExitedProc:
+        returncode = 0
+
+        def poll(self) -> int:
+            return 0
+
+    class LingeringPump:
+        def __init__(self) -> None:
+            self.alive = True
+            self.joins = 0
+
+        def join(self, timeout=None) -> None:  # type: ignore[no-untyped-def]
+            self.joins += 1
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+    proc = ExitedProc()
+    pump = LingeringPump()
+    monkeypatch.setattr(rollout, "inference_active", True)
+    monkeypatch.setattr(rollout, "_inference_proc", proc)
+    monkeypatch.setattr(rollout, "_inference_pump_thread", pump)
+    monkeypatch.setattr(rollout, "_inference_meta", {"policy_ref": "fixture"})
+
+    pending = rollout.handle_inference_status()
+
+    assert pending["inference_active"] is True
+    assert pending["exited"] is True
+    assert pending["cleanup_pending"] is True
+    assert rollout._inference_proc is proc
+
+    pump.alive = False
+    terminal = rollout.handle_inference_status()
+    assert terminal["inference_active"] is False
+    assert terminal["outcome"] == "ok"
+    assert rollout._inference_proc is None
 
 
 def test_classify_outcome_ok_warns_and_fails() -> None:

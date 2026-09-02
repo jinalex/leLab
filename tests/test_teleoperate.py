@@ -18,6 +18,17 @@ from __future__ import annotations
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _reset_teleoperation_globals(monkeypatch: pytest.MonkeyPatch) -> None:
+    import lelab.teleoperate as teleop
+
+    monkeypatch.setattr(teleop, "teleoperation_active", False)
+    monkeypatch.setattr(teleop, "teleoperation_thread", None)
+    monkeypatch.setattr(teleop, "current_robot", None)
+    monkeypatch.setattr(teleop, "current_teleop", None)
+    monkeypatch.setattr(teleop, "_teleoperation_terminal_status", None)
+
+
 def test_teleoperate_request_rejects_missing_fields() -> None:
     from pydantic import ValidationError
 
@@ -189,3 +200,161 @@ def test_start_teleoperation_disconnects_follower_when_leader_fails(
     # The already-connected follower must have been cleaned up.
     assert created["follower"].disconnected is True
     assert teleop.teleoperation_active is False
+
+
+def test_worker_natural_failure_is_retained_across_status_polls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from types import SimpleNamespace
+
+    import lelab.teleoperate as teleop
+
+    class Bus:
+        def __init__(self) -> None:
+            self.is_connected = False
+
+        def connect(self) -> None:
+            self.is_connected = True
+
+        def write_calibration(self, calibration) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+    class Follower:
+        def __init__(self, _config) -> None:  # type: ignore[no-untyped-def]
+            self.bus = Bus()
+            self.cameras: dict = {}
+            self.calibration = {}
+
+        @property
+        def is_connected(self) -> bool:
+            return self.bus.is_connected
+
+        def configure(self) -> None:
+            pass
+
+        def disconnect(self) -> None:
+            self.bus.is_connected = False
+
+        def send_action(self, _action) -> None:  # type: ignore[no-untyped-def]
+            pass
+
+    class Leader(Follower):
+        def get_action(self):  # type: ignore[no-untyped-def]
+            raise RuntimeError("leader loop failed")
+
+    class InlineThread:
+        def __init__(self, *, target, **_kwargs) -> None:  # type: ignore[no-untyped-def]
+            self.target = target
+            self.alive = False
+
+        def start(self) -> None:
+            self.alive = True
+            try:
+                self.target()
+            finally:
+                self.alive = False
+
+        def is_alive(self) -> bool:
+            return self.alive
+
+    monkeypatch.setattr(teleop, "setup_calibration_files", lambda *_args: ("leader", "follower"))
+    monkeypatch.setattr(teleop, "SO101FollowerConfig", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(teleop, "SO101LeaderConfig", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(teleop, "SO101Follower", Follower)
+    monkeypatch.setattr(teleop, "SO101Leader", Leader)
+    monkeypatch.setattr(teleop.threading, "Thread", InlineThread)
+
+    result = teleop.handle_start_teleoperation(
+        teleop.TeleoperateRequest(
+            leader_port="COM_LEADER",
+            follower_port="COM_FOLLOWER",
+            leader_config="leader",
+            follower_config="follower",
+        )
+    )
+
+    assert result["success"] is True
+    first = teleop.handle_teleoperation_status()
+    second = teleop.handle_teleoperation_status()
+    assert first == second
+    assert first["teleoperation_active"] is False
+    assert first["exited"] is True
+    assert first["outcome"] == "failed"
+    assert first["error"] == "leader loop failed"
+    assert first["cleanup_pending"] is False
+
+
+def test_worker_unproven_cleanup_is_retained_and_blocks_restart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lelab.teleoperate as teleop
+
+    class Device:
+        is_connected = True
+
+        def disconnect(self) -> None:
+            pass
+
+    robot = Device()
+    teleoperator = Device()
+    robot_error, robot_proven = teleop._safe_disconnect(robot)
+    teleop_error, teleop_proven = teleop._safe_disconnect(teleoperator)
+    teleop._teleoperation_terminal_status = {
+        "exited": True,
+        "outcome": "failed",
+        "error": "; ".join(error for error in (robot_error, teleop_error) if error),
+        "cleanup_pending": not (robot_proven and teleop_proven),
+    }
+    teleop.current_robot = robot
+    teleop.current_teleop = teleoperator
+
+    status = teleop.handle_teleoperation_status()
+    assert status["cleanup_pending"] is True
+    assert teleop.current_robot is robot
+    assert teleop.current_teleop is teleoperator
+
+    monkeypatch.setattr(teleop, "setup_calibration_files", lambda *_args: ("leader", "follower"))
+    result = teleop.handle_start_teleoperation(
+        teleop.TeleoperateRequest(
+            leader_port="COM_LEADER",
+            follower_port="COM_FOLLOWER",
+            leader_config="leader",
+            follower_config="follower",
+        )
+    )
+    assert result["success"] is False
+    assert "cleanup is unproven" in result["message"]
+
+
+def test_stop_timeout_keeps_worker_reference_and_returns_pending(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import lelab.teleoperate as teleop
+
+    class LingeringThread:
+        def __init__(self) -> None:
+            self.joins: list[float | None] = []
+
+        def is_alive(self) -> bool:
+            return True
+
+        def join(self, timeout=None) -> None:  # type: ignore[no-untyped-def]
+            self.joins.append(timeout)
+
+    worker = LingeringThread()
+    monkeypatch.setattr(teleop, "teleoperation_active", True)
+    monkeypatch.setattr(teleop, "teleoperation_thread", worker)
+
+    result = teleop.handle_stop_teleoperation()
+
+    assert result == {
+        "success": False,
+        "message": "Teleoperation stop requested, but the worker is still shutting down",
+        "stop_pending": True,
+        "cleanup_proven": False,
+    }
+    assert worker.joins == [5.0]
+    assert teleop.teleoperation_thread is worker
+    status = teleop.handle_teleoperation_status()
+    assert status["outcome"] == "stopping"
+    assert status["cleanup_pending"] is True
