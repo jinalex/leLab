@@ -103,6 +103,11 @@ def robot_store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):  # type: ignor
     monkeypatch.setattr(config, "ROBOTS_PATH", str(robots))
     monkeypatch.setattr(config, "FOLLOWER_CONFIG_PATH", str(followers))
     monkeypatch.setattr(config, "LEADER_CONFIG_PATH", str(leaders))
+    monkeypatch.setattr(
+        server.job_registry,
+        "require_registered_checkpoint_ref",
+        lambda policy_ref: policy_ref,
+    )
     coordinator = _CoordinatorStub()
     monkeypatch.setattr(server, "_control", lambda: coordinator)
     return SimpleNamespace(
@@ -636,6 +641,37 @@ def test_canonical_inference_uses_saved_follower_identity(
     request = received[0]
     assert request.follower_port == "/saved/follower"
     assert request.follower_config == "follower.json"
+
+
+def test_inference_rejects_a_policy_ref_not_authorized_by_the_job_registry(
+    robot_store,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:  # type: ignore[no-untyped-def]
+    from lelab import server
+
+    _write_calibrations(robot_store)
+    (robot_store.robots / "desk-arm.json").write_text(json.dumps(_v2_record()))
+    monkeypatch.setattr(
+        server.job_registry,
+        "require_registered_checkpoint_ref",
+        lambda _policy_ref: (_ for _ in ()).throw(
+            ValueError("policy_ref must identify a registered model checkpoint")
+        ),
+    )
+
+    response = server.start_inference(
+        {
+            "robot_name": "desk-arm",
+            "policy_ref": "/private/arbitrary-model",
+            "task": "move cube",
+            "duration_s": 12,
+        }
+    )
+
+    assert isinstance(response, JSONResponse)
+    assert response.status_code == 400
+    assert "registered model checkpoint" in _json_body(response)["message"]
+    assert robot_store.coordinator.calls == []
 
 
 def test_inference_uses_only_exact_saved_camera_configuration(robot_store) -> None:  # type: ignore[no-untyped-def]

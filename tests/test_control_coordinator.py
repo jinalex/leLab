@@ -12,7 +12,11 @@ from types import SimpleNamespace
 
 import pytest
 
-from lelab.control_coordinator import ControlCoordinator, ControlOwnerStartError
+from lelab.control_coordinator import (
+    ControlCoordinator,
+    ControlOwnerStartError,
+    _ManagedOwner,
+)
 from lelab.control_runtime import ControlRuntime
 from lelab.control_session import (
     NOT_ATTEMPTED_TORQUE,
@@ -278,6 +282,60 @@ def test_delayed_managed_teardown_is_reaped_without_early_release(
     assert terminal.state is ControlState.ERROR
     assert coordinator._owner is None
     assert manager.quarantine_reason is None
+
+
+def test_retained_owner_reaping_is_serialized_across_concurrent_callers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = ControlSessionManager(lease_ttl_s=10.0, lease_renew_interval_s=1.0)
+    coordinator = ControlCoordinator(manager, monitor_interval_s=0.002)
+    claim = manager.claim(ControlOperation.CONTROLLER_CHECK, teleoperator_type="stadia")
+    manager.mark_running(claim.session_id)
+    manager.request_failure(claim.session_id, reason="monitor failed")
+
+    class ExitedWorker:
+        is_alive = False
+
+        def join(self, *, timeout: float | None = None) -> None:
+            return None
+
+    coordinator._owner = _ManagedOwner(claim=claim, worker=ExitedWorker())
+    coordinator._recovery_sessions[claim.session_id] = "monitor failed"
+    original_finish = manager.finish_teardown
+    finish_entered = threading.Event()
+    allow_finish = threading.Event()
+    finish_calls: list[str] = []
+
+    def blocking_finish(session_id: str, **kwargs):  # type: ignore[no-untyped-def]
+        finish_calls.append(session_id)
+        finish_entered.set()
+        assert allow_finish.wait(1.0)
+        return original_finish(session_id, **kwargs)
+
+    monkeypatch.setattr(manager, "finish_teardown", blocking_finish)
+    results: list[bool] = []
+    errors: list[BaseException] = []
+
+    def reap() -> None:
+        try:
+            results.append(coordinator._reap_retained_owner_once(claim.session_id))
+        except BaseException as error:
+            errors.append(error)
+
+    callers = [threading.Thread(target=reap), threading.Thread(target=reap)]
+    for caller in callers:
+        caller.start()
+    assert finish_entered.wait(1.0)
+    time.sleep(0.02)
+    assert finish_calls == [claim.session_id]
+    allow_finish.set()
+    for caller in callers:
+        caller.join(1.0)
+
+    assert errors == []
+    assert results == [True, True]
+    terminal = manager.status_for(claim.session_id, check_expiry=False)
+    assert terminal is not None and terminal.terminal
 
 
 def test_stadia_recording_returns_stamped_id_and_exposes_only_exact_active_worker() -> None:

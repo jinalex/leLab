@@ -151,6 +151,7 @@ class ControlCoordinator:
         self.monitor_interval_s = _finite_positive(monitor_interval_s, "monitor_interval_s")
         self._sleeper = sleeper
         self._lock = threading.Lock()
+        self._reap_lock = threading.Lock()
         self._owner: Owner | None = None
         self._monitor_threads: dict[str, threading.Thread] = {}
         self._monitor_errors: dict[str, BaseException] = {}
@@ -939,6 +940,12 @@ class ControlCoordinator:
 
     def _reap_retained_owner_once(self, session_id: str | None = None) -> bool:
         """Advance only owners explicitly quarantined by monitor failure."""
+
+        with self._reap_lock:
+            return self._reap_retained_owner_once_serialized(session_id)
+
+    def _reap_retained_owner_once_serialized(self, session_id: str | None = None) -> bool:
+        """Run one retained-owner transition without a competing reaper."""
 
         with self._lock:
             owner = self._owner

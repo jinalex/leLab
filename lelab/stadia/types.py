@@ -79,6 +79,7 @@ ACTION_KEYS = tuple(spec.action_key for spec in DEFAULT_JOINT_SPECS)
 class TriggerNeutralState:
     exercised: bool = False
     released: bool = False
+    requires_exercise: bool = False
 
 
 @dataclass(frozen=True)

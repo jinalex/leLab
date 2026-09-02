@@ -86,14 +86,32 @@ def _dpad_y(snapshot: StadiaSnapshot) -> int:
 
 
 def _observe_trigger(value: float, previous: TriggerNeutralState) -> TriggerNeutralState:
-    """Treat a signed-axis midpoint as ambiguous until a released sample is seen."""
+    """Require a full exercise/release cycle after an ambiguous midpoint."""
 
     value = float(value)
     if not math.isfinite(value):
-        return TriggerNeutralState(exercised=previous.exercised, released=False)
+        return TriggerNeutralState(
+            exercised=previous.exercised,
+            released=False,
+            requires_exercise=True,
+        )
     if value <= -0.85:
-        return TriggerNeutralState(exercised=previous.exercised, released=True)
-    return TriggerNeutralState(exercised=True, released=False)
+        return TriggerNeutralState(
+            exercised=previous.exercised,
+            released=not previous.requires_exercise or previous.exercised,
+            requires_exercise=previous.requires_exercise,
+        )
+    if value >= 0.85:
+        return TriggerNeutralState(
+            exercised=True,
+            released=False,
+            requires_exercise=previous.requires_exercise,
+        )
+    return TriggerNeutralState(
+        exercised=previous.exercised,
+        released=False,
+        requires_exercise=True,
+    )
 
 
 class NeutralReleaseGate:

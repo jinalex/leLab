@@ -271,3 +271,45 @@ def test_register_imported_hub_repo(monkeypatch, tmp_path) -> None:
     assert rec.output_dir == ""
     cks = reg.list_checkpoints(rec.id)
     assert [c.ref for c in cks] == ["user/some-model@root"]
+
+
+def test_registered_local_checkpoint_is_authorized_without_probing_an_unregistered_path(
+    tmp_path,
+) -> None:
+    from lelab.jobs import JobRegistry
+
+    registered = tmp_path / "registered-model"
+    unregistered = tmp_path / "unregistered-model"
+    _make_pretrained(registered)
+    _make_pretrained(unregistered)
+    reg = JobRegistry(tmp_path / "root")
+    reg.register_imported(str(registered))
+
+    assert reg.require_registered_checkpoint_ref(str(registered.resolve())) == str(registered.resolve())
+    with pytest.raises(ValueError, match="registered model checkpoint"):
+        reg.require_registered_checkpoint_ref(str(unregistered.resolve()))
+
+
+def test_unregistered_hub_ref_is_rejected_without_contacting_that_repo(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    from lelab.jobs import JobRegistry
+
+    calls: list[str] = []
+
+    class FakeApi:
+        def list_repo_files(self, repo_id, repo_type):
+            calls.append(repo_id)
+            return ["config.json"]
+
+    monkeypatch.setattr("lelab.utils.hf_auth.shared_hf_api", lambda: FakeApi())
+    reg = JobRegistry(tmp_path / "root")
+    reg.register_imported("owner/registered")
+    calls.clear()
+
+    with pytest.raises(ValueError, match="registered model checkpoint"):
+        reg.require_registered_checkpoint_ref("attacker/unregistered@root")
+    assert calls == []
+    assert reg.require_registered_checkpoint_ref("owner/registered@root") == ("owner/registered@root")
+    assert calls == ["owner/registered"]

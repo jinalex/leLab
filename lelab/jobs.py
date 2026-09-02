@@ -1038,6 +1038,43 @@ class JobRegistry:
             raise JobNotFoundError(job_id)
         return self._checkpoints_for(record)
 
+    def require_registered_checkpoint_ref(self, policy_ref: str) -> str:
+        """Return one exact checkpoint ref already owned by this registry.
+
+        Inference accepts opaque refs because registered local models and Hub
+        checkpoints use different representations.  Authorization must still
+        come from this server-owned registry rather than from a duplicated
+        browser string: importantly, this method never probes an unregistered
+        caller-supplied path or Hub repository.
+        """
+
+        if not isinstance(policy_ref, str) or not policy_ref or policy_ref.strip() != policy_ref:
+            raise ValueError("policy_ref must identify a registered model checkpoint")
+        hub_match = _HUB_CKPT_REF_RE.match(policy_ref) or _HUB_ROOT_REF_RE.match(policy_ref)
+        requested_repo = hub_match.group("repo") if hub_match is not None else None
+        with self._lock:
+            records = tuple(self._records.values())
+
+        verification_failed = False
+        for record in records:
+            if requested_repo is not None:
+                if record.hf_repo_id != requested_repo:
+                    continue
+            elif record.hf_repo_id is not None:
+                continue
+            try:
+                checkpoints = self._checkpoints_for(record)
+            except Exception:
+                verification_failed = True
+                continue
+            for checkpoint in checkpoints:
+                if checkpoint.ref == policy_ref:
+                    return checkpoint.ref
+
+        if verification_failed:
+            raise ValueError("the registered policy checkpoint could not be verified")
+        raise ValueError("policy_ref must identify a registered model checkpoint")
+
     def _list_cloud_cached(self, repo_id: str | None) -> builtins.list[JobCheckpoint]:
         """30s-TTL cache over the hub checkpoint listing (`_list_imported_hub`:
         the checkpoints/<step>/ tree, else the root model). All hub listings —

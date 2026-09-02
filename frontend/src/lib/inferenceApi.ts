@@ -30,9 +30,13 @@ export interface InferenceStatus {
   log_path: string | null;
   exited?: boolean;
   exit_code?: number | null;
-  outcome?: "ok" | "ran_with_warning" | "failed";
+  outcome?: "idle" | "running" | "stopped" | "ok" | "ran_with_warning" | "failed";
   error?: string | null;
   hint?: string | null;
+  cleanup_pending: boolean;
+  stop_pending?: boolean;
+  startup_failed?: boolean;
+  stop_error?: string;
   session_id: string;
   control_status: unknown;
 }
@@ -58,7 +62,7 @@ const nullableFinite = (value: unknown): value is number | null =>
 const nullableString = (value: unknown): value is string | null =>
   value === null || typeof value === "string";
 
-const parseInferenceStatus = (value: unknown): InferenceStatus | null => {
+export const parseInferenceStatus = (value: unknown): InferenceStatus | null => {
   const required = [
     "inference_active",
     "started_at",
@@ -68,10 +72,20 @@ const parseInferenceStatus = (value: unknown): InferenceStatus | null => {
     "duration_s",
     "policy_ref",
     "log_path",
+    "cleanup_pending",
     "session_id",
     "control_status",
   ];
-  const optional = ["exited", "exit_code", "outcome", "error", "hint"];
+  const optional = [
+    "exited",
+    "exit_code",
+    "outcome",
+    "error",
+    "hint",
+    "stop_pending",
+    "startup_failed",
+    "stop_error",
+  ];
   if (
     !isObject(value) ||
     !hasExactKeys(value, required, optional) ||
@@ -90,6 +104,7 @@ const parseInferenceStatus = (value: unknown): InferenceStatus | null => {
     (value.duration_s !== null && value.duration_s <= 0) ||
     !nullableString(value.policy_ref) ||
     !nullableString(value.log_path) ||
+    typeof value.cleanup_pending !== "boolean" ||
     typeof value.session_id !== "string" ||
     !value.session_id.trim() ||
     value.session_id.trim() !== value.session_id ||
@@ -99,11 +114,17 @@ const parseInferenceStatus = (value: unknown): InferenceStatus | null => {
       value.exit_code !== null &&
       !Number.isInteger(value.exit_code)) ||
     (value.outcome !== undefined &&
+      value.outcome !== "idle" &&
+      value.outcome !== "running" &&
+      value.outcome !== "stopped" &&
       value.outcome !== "ok" &&
       value.outcome !== "ran_with_warning" &&
       value.outcome !== "failed") ||
     (value.error !== undefined && !nullableString(value.error)) ||
-    (value.hint !== undefined && !nullableString(value.hint))
+    (value.hint !== undefined && !nullableString(value.hint)) ||
+    (value.stop_pending !== undefined && typeof value.stop_pending !== "boolean") ||
+    (value.startup_failed !== undefined && typeof value.startup_failed !== "boolean") ||
+    (value.stop_error !== undefined && typeof value.stop_error !== "string")
   ) {
     return null;
   }

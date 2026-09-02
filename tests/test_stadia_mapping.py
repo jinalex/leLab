@@ -197,6 +197,11 @@ def test_ambiguous_trigger_startup_requires_exercise_and_release() -> None:
 
     decision = gate.evaluate(midpoint, decision.state)
     assert decision.reason == "exercise and release both triggers"
+    direct_release = gate.evaluate(snapshot(sequence=2), decision.state)
+    assert not direct_release.controls_neutral
+    assert not direct_release.state.left_trigger.released
+    assert not direct_release.state.right_trigger.released
+    assert direct_release.reason == "exercise and release both triggers"
     exercised = gate.evaluate(snapshot(axes=(0.0, 0.0, 0.0, 0.0, 1.0, 1.0)), decision.state)
     released = gate.evaluate(snapshot(sequence=5), exercised.state)
     assert released.state.left_trigger.exercised

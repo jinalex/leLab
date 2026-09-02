@@ -893,11 +893,12 @@ def _resolve_inference_request(
     if not readiness.ready:
         reasons = " ".join(issue.message for issue in readiness.issues)
         raise ValueError(f"saved robot is not ready for inference: {reasons}")
+    policy_ref = job_registry.require_registered_checkpoint_ref(parsed.policy_ref)
     cameras = _resolve_inference_cameras(record, parsed.cameras)
     return record, InferenceRequest(
         follower_port=record.follower.port,
         follower_config=record.follower.calibration,
-        policy_ref=parsed.policy_ref,
+        policy_ref=policy_ref,
         task=parsed.task,
         cameras=cameras,
         duration_s=parsed.duration_s,
