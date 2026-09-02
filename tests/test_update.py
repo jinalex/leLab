@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -132,7 +133,7 @@ def test_check_update_available(monkeypatch):
     assert status["latest_commit"] == "def456"
     assert status["commits_behind"] == 7
     assert status["compare_url"].endswith("abc123...def456")
-    assert "git+https://github.com/huggingface/leLab.git" in status["update_command"]
+    assert status["update_command"]
     assert status["can_auto_update"] is True
 
 
@@ -217,17 +218,37 @@ def test_run_update_no_source(monkeypatch):
 
 
 def test_update_command_for_uv_tool_install(monkeypatch):
-    """Standard `uv tool install` setup updates the tool in place with --force."""
+    """A uv tool update retains its receipt and the current Python minor."""
     monkeypatch.setattr(update.shutil, "which", lambda name: "/usr/bin/uv")
     monkeypatch.setattr(update, "_is_uv_tool_install", lambda: True)
+    monkeypatch.setattr(update.sys, "version_info", type("Version", (), {"major": 3, "minor": 12})())
     cmd = update._build_update_cmd("huggingface", "leLab")
     assert cmd == [
         "uv",
         "tool",
-        "install",
-        "--force",
-        "git+https://github.com/huggingface/leLab.git",
+        "upgrade",
+        "--python",
+        "3.12",
+        "--reinstall",
+        "lelab",
     ]
+
+
+def test_custom_uv_tool_directory_is_detected_from_its_receipt(monkeypatch, tmp_path: Path) -> None:
+    prefix = tmp_path / "custom-tools" / "lelab"
+    prefix.mkdir(parents=True)
+    (prefix / "uv-receipt.toml").write_text("[tool]\n")
+    monkeypatch.setattr(update.sys, "prefix", str(prefix))
+
+    assert update._is_uv_tool_install()
+
+
+def test_uv_like_path_without_receipt_is_not_a_tool_install(monkeypatch, tmp_path: Path) -> None:
+    prefix = tmp_path / "uv" / "tools" / "lelab"
+    prefix.mkdir(parents=True)
+    monkeypatch.setattr(update.sys, "prefix", str(prefix))
+
+    assert not update._is_uv_tool_install()
 
 
 def test_update_command_for_pip_env(monkeypatch):
