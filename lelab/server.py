@@ -369,6 +369,12 @@ class ControlSessionBody(BaseModel):
     session_id: str = Field(min_length=1)
 
 
+class StadiaSpeedBody(ControlSessionBody):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    multiplier: float = Field(ge=0.25, le=2.0)
+
+
 class ControllerCheckBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -1017,6 +1023,16 @@ def stop_control(body: ControlSessionBody):
                 reason="stop requested by control UI",
             )
         )
+    except Exception as error:
+        return _control_failure(error, requested_session_id=body.session_id)
+
+
+@app.post("/control-speed")
+def set_control_speed(body: StadiaSpeedBody):
+    """Set a bounded live Stadia speed for one exact running owner."""
+
+    try:
+        return _status_response(_control().set_stadia_speed(body.session_id, body.multiplier))
     except Exception as error:
         return _control_failure(error, requested_session_id=body.session_id)
 

@@ -193,6 +193,27 @@ class ControlCoordinator:
             raise StaleSessionError(f"session {session_id!r} does not own control")
         return self.manager.request_stop(status.session_id, reason=reason)
 
+    def set_stadia_speed(self, session_id: str, multiplier: float) -> ControlStatus:
+        """Change one exact live Stadia teleoperation speed without device access."""
+
+        self._reap_retained_owner_once()
+        status = self.manager.active_status()
+        if status is None or status.session_id != session_id:
+            raise StaleSessionError(f"session {session_id!r} does not own control")
+        if status.operation is not ControlOperation.STADIA_TELEOPERATION:
+            raise InvalidControlTransitionError("speed controls are available only for Stadia teleoperation")
+        with self._lock:
+            owner = self._owner
+            if not isinstance(owner, _ManagedOwner) or owner.claim.session_id != session_id:
+                raise InvalidControlTransitionError("the Stadia worker is not available")
+            setter = getattr(owner.worker, "set_speed_multiplier", None)
+        if not callable(setter):
+            raise InvalidControlTransitionError("the Stadia worker has no speed control")
+        updated = setter(multiplier)
+        if not isinstance(updated, ControlStatus) or updated.session_id != session_id:
+            raise TypeError("the Stadia worker returned invalid speed status")
+        return updated
+
     def start_managed_worker(
         self,
         operation: ControlOperation | str,
@@ -442,13 +463,29 @@ class ControlCoordinator:
             )
 
         if stadia_worker_factory is None:
-            stadia_worker_factory = self._default_stadia_worker
+
+            def build_default_stadia_worker(
+                selected_claim: ControlSessionClaim,
+                selected: ResolvedControlRequest,
+            ) -> ManagedWorker:
+                return self._default_stadia_worker(
+                    selected_claim,
+                    selected,
+                    websocket_manager=websocket_manager,
+                )
+
+            stadia_worker_factory = build_default_stadia_worker
+        record = resolved.record_model()
         try:
             claim, status = self.start_managed_worker(
                 ControlOperation.STADIA_TELEOPERATION,
                 lambda selected_claim: stadia_worker_factory(selected_claim, resolved),
                 teleoperator_type="stadia",
-                details={"robot_name": resolved.robot_name},
+                details={
+                    "robot_name": resolved.robot_name,
+                    "stadia_speed_multiplier": 1.0,
+                    "stadia_effective_max_step_per_tick": record.stadia.max_step_per_tick,
+                },
             )
         except ControlOwnerStartError as error:
             return error.as_result()
@@ -633,10 +670,19 @@ class ControlCoordinator:
         self,
         claim: ControlSessionClaim,
         resolved: ResolvedControlRequest,
+        *,
+        websocket_manager: object | None = None,
     ) -> ManagedWorker:
         from .stadia.session import StadiaSessionConfig, StadiaSessionWorker
 
         record = resolved.record_model()
+        broadcaster = (
+            getattr(websocket_manager, "broadcast_joint_data_sync", None)
+            if websocket_manager is not None
+            else None
+        )
+        if broadcaster is not None and not callable(broadcaster):
+            raise TypeError("websocket manager broadcaster must be callable")
         return StadiaSessionWorker(
             manager=self.manager,
             claim=claim,
@@ -655,6 +701,7 @@ class ControlCoordinator:
                 # its own lazily constructed camera configs.
                 cameras={},
             ),
+            joint_broadcaster=broadcaster,
         )
 
     def _default_controller_check_worker(

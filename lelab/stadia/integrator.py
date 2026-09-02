@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
+from numbers import Real
 
 from .action import compare_requested_returned, validate_returned_action
 from .types import (
@@ -60,6 +62,16 @@ class BoundedStadiaIntegrator:
                     raise ValueError("gripper endpoint bounds must overlap 0-100")
             self.endpoint_bounds[key] = (lower, upper)
         self.counters = IntegratorCounters()
+
+    def set_max_step_per_tick(self, value: float) -> None:
+        """Update the live per-tick cap without changing the accepted target."""
+
+        if isinstance(value, bool) or not isinstance(value, Real):
+            raise ValueError("max_step_per_tick must be a finite positive number")
+        numeric = float(value)
+        if not math.isfinite(numeric) or numeric <= 0:
+            raise ValueError("max_step_per_tick must be a finite positive number")
+        self.specs = tuple(replace(spec, max_step_per_tick=numeric) for spec in self.specs)
 
     def integrate_one_step(self, deltas: Mapping[str, float], *, enabled: bool) -> IntegrationResult:
         values = _exact_finite_values(deltas, self.keys, "joint deltas")

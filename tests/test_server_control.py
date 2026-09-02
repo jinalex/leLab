@@ -55,6 +55,16 @@ class _CoordinatorStub:
         self.calls.append(("stop", (session_id, reason)))
         return self.manager.request_stop(session_id, reason=reason)
 
+    def set_stadia_speed(self, session_id: str, multiplier: float):  # type: ignore[no-untyped-def]
+        self.calls.append(("speed", (session_id, multiplier)))
+        return self.manager.merge_details(
+            session_id,
+            {
+                "stadia_speed_multiplier": multiplier,
+                "stadia_effective_max_step_per_tick": 0.35 * multiplier,
+            },
+        )
+
     def start_teleoperation(self, request, *, websocket_manager=None):  # type: ignore[no-untyped-def]
         self.calls.append(("teleoperation", (dict(request), websocket_manager)))
         return {"success": True, "session_id": "teleop-session"}
@@ -238,6 +248,24 @@ def test_generic_control_routes_require_exact_session_and_return_stopping(monkey
     stopping = server.stop_control(server.ControlSessionBody(session_id=claim.session_id))
     assert stopping["status"]["state"] == "stopping"
     assert stopping["status"]["teardown_completed_at_utc"] is None
+
+
+def test_stadia_speed_route_uses_exact_session_and_returns_revision(robot_store) -> None:  # type: ignore[no-untyped-def]
+    from lelab import server
+
+    claim = robot_store.coordinator.manager.claim(
+        ControlOperation.STADIA_TELEOPERATION,
+        teleoperator_type="stadia",
+    )
+    robot_store.coordinator.manager.mark_running(claim.session_id)
+
+    response = server.set_control_speed(server.StadiaSpeedBody(session_id=claim.session_id, multiplier=1.75))
+
+    assert response["success"] is True
+    assert response["session_id"] == claim.session_id
+    assert response["status"]["session_id"] == claim.session_id
+    assert response["status"]["details"]["stadia_speed_multiplier"] == 1.75
+    assert robot_store.coordinator.calls[-1] == ("speed", (claim.session_id, 1.75))
 
 
 def test_failed_runtime_is_not_replaced_by_an_ordinary_request(monkeypatch) -> None:  # type: ignore[no-untyped-def]

@@ -102,6 +102,43 @@ def test_managed_worker_owns_terminal_publication_and_exact_stop() -> None:
     assert workers[0].is_alive is False
 
 
+def test_live_stadia_speed_is_dispatched_only_to_the_exact_managed_owner() -> None:
+    manager = ControlSessionManager(lease_ttl_s=10.0, lease_renew_interval_s=1.0)
+    coordinator = ControlCoordinator(manager, monitor_interval_s=0.002)
+
+    class SpeedWorker(FakeManagedWorker):
+        def set_speed_multiplier(self, multiplier: float):  # type: ignore[no-untyped-def]
+            return self.manager.merge_details(
+                self.claim.session_id,
+                {"stadia_speed_multiplier": multiplier},
+            )
+
+    worker: SpeedWorker | None = None
+
+    def build(claim):  # type: ignore[no-untyped-def]
+        nonlocal worker
+        worker = SpeedWorker(manager, claim)
+        return worker
+
+    claim, _ = coordinator.start_managed_worker(
+        ControlOperation.STADIA_TELEOPERATION,
+        build,
+        teleoperator_type="stadia",
+    )
+    deadline = time.monotonic() + 1.0
+    while manager.active_status(check_expiry=False).state is ControlState.STARTING:
+        assert time.monotonic() < deadline
+        time.sleep(0.002)
+
+    updated = coordinator.set_stadia_speed(claim.session_id, 1.5)
+
+    assert updated.details["stadia_speed_multiplier"] == 1.5
+    with pytest.raises(StaleSessionError):
+        coordinator.set_stadia_speed("another-session", 1.5)
+    coordinator.request_stop(claim.session_id)
+    wait_for_terminal(manager, claim.session_id)
+
+
 def test_managed_worker_construction_failure_returns_issued_terminal_status() -> None:
     manager = ControlSessionManager(lease_ttl_s=10.0, lease_renew_interval_s=1.0)
     coordinator = ControlCoordinator(manager)
@@ -807,6 +844,43 @@ def test_teleoperation_adapter_uses_canonical_record_for_legacy_payload() -> Non
             socket_manager,
         )
     ]
+    coordinator.request_stop(str(result["session_id"]))
+    wait_for_terminal(manager, str(result["session_id"]))
+
+
+def test_default_stadia_teleoperation_receives_the_websocket_broadcaster(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = ControlSessionManager(lease_ttl_s=10.0, lease_renew_interval_s=1.0)
+    coordinator = ControlCoordinator(manager, monitor_interval_s=0.002)
+    socket_manager = SimpleNamespace(broadcast_joint_data_sync=lambda _payload: None)
+    record = SimpleNamespace(stadia=SimpleNamespace(max_step_per_tick=0.35))
+    resolved = SimpleNamespace(
+        teleoperator_type="stadia",
+        robot_name="saved-arm",
+        record_model=lambda: record,
+    )
+    received: list[object] = []
+    workers: list[FakeManagedWorker] = []
+
+    def build(claim, _resolved, *, websocket_manager=None):  # type: ignore[no-untyped-def]
+        received.append(websocket_manager)
+        worker = FakeManagedWorker(manager, claim)
+        workers.append(worker)
+        return worker
+
+    monkeypatch.setattr(coordinator, "_default_stadia_worker", build)
+
+    result = coordinator.start_teleoperation(
+        {"robot_name": "saved-arm"},
+        websocket_manager=socket_manager,
+        resolver=lambda _request: resolved,
+    )
+
+    assert result["success"] is True
+    assert received == [socket_manager]
+    assert result["status"]["details"]["stadia_speed_multiplier"] == 1.0
+    assert result["status"]["details"]["stadia_effective_max_step_per_tick"] == 0.35
     coordinator.request_stop(str(result["session_id"]))
     wait_for_terminal(manager, str(result["session_id"]))
 

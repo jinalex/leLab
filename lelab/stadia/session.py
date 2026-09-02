@@ -22,6 +22,7 @@ from lelab.control_session import (
     ControlSessionClaim,
     ControlSessionManager,
     ControlState,
+    ControlStatus,
     JointStatusSpec,
     JointStatusUnit,
     MotionState,
@@ -48,6 +49,17 @@ MAX_SNAPSHOT_AGE_S = 0.15
 THERMAL_INTERVAL_S = 1.0
 FOLLOWER_READ_RETRIES = 5
 MAX_RELATIVE_TARGET = 5.0
+MIN_SPEED_MULTIPLIER = 0.25
+MAX_SPEED_MULTIPLIER = 2.0
+
+_ACTION_TO_URDF_JOINT = {
+    "shoulder_pan.pos": "Rotation",
+    "shoulder_lift.pos": "Pitch",
+    "elbow_flex.pos": "Elbow",
+    "wrist_flex.pos": "Wrist_Pitch",
+    "wrist_roll.pos": "Wrist_Roll",
+    "gripper.pos": "Jaw",
+}
 
 
 class StadiaSessionError(RuntimeError):
@@ -450,6 +462,7 @@ class StadiaSessionWorker:
         calibration_resolver: Callable[[str], str] = _default_calibration_resolver,
         follower_factory: Callable[[FollowerBuildSpec], object] = _default_follower_factory,
         thermal_guard_factory: Callable[[object, Callable[[float], None]], object] = (_default_thermal_guard),
+        joint_broadcaster: Callable[[Mapping[str, object]], None] | None = None,
         clock: Callable[[], float] = time.monotonic,
         sleeper: Callable[[float], None] = time.sleep,
     ) -> None:
@@ -460,6 +473,7 @@ class StadiaSessionWorker:
         self._calibration_resolver = calibration_resolver
         self._follower_factory = follower_factory
         self._thermal_guard_factory = thermal_guard_factory
+        self._joint_broadcaster = joint_broadcaster
         self._clock = clock
         self._sleeper = sleeper
 
@@ -487,6 +501,9 @@ class StadiaSessionWorker:
         self._controller_error: str | None = None
         self._controller_monitoring_active = False
         self._resource_release_unproven = False
+        self._speed_lock = threading.Lock()
+        self._speed_multiplier = 1.0
+        self._movement_enabled = False
         self._lifecycle_lock = threading.Lock()
         self._run_started = False
         self._thread: threading.Thread | None = None
@@ -553,6 +570,36 @@ class StadiaSessionWorker:
         """Signal this exact manager-owned session to hold and tear down."""
 
         self.manager.request_stop(self.claim.session_id, reason=reason)
+
+    def set_speed_multiplier(self, multiplier: float) -> ControlStatus:
+        """Apply a bounded live Stadia speed while the dead-man is released."""
+
+        if isinstance(multiplier, bool) or not isinstance(multiplier, Real):
+            raise ValueError("speed multiplier must be a finite number")
+        numeric = float(multiplier)
+        if not math.isfinite(numeric) or not MIN_SPEED_MULTIPLIER <= numeric <= MAX_SPEED_MULTIPLIER:
+            raise ValueError(
+                f"speed multiplier must be between {MIN_SPEED_MULTIPLIER:g}x and {MAX_SPEED_MULTIPLIER:g}x"
+            )
+        status = self.manager.status_for(self.claim.session_id, check_expiry=False)
+        if status is None or status.state is not ControlState.RUNNING:
+            raise StadiaSessionRuntimeError("Stadia speed can change only while teleoperation is running")
+        with self._speed_lock:
+            if self._movement_enabled:
+                raise StadiaSessionRuntimeError("release RB before changing Stadia speed")
+            if self._integrator is None or not self._joint_status_specs:
+                raise StadiaSessionRuntimeError("Stadia speed controls are not ready")
+            effective_step = self.config.max_step_per_tick * numeric
+            self._integrator.set_max_step_per_tick(effective_step)
+            self._joint_status_specs = tuple(
+                replace(spec, max_step_per_tick=effective_step) for spec in self._joint_status_specs
+            )
+            self._speed_multiplier = numeric
+            return self.manager.update_joint_specs_and_details(
+                self.claim.session_id,
+                joint_specs=self._joint_status_specs,
+                details_patch=self._speed_details(),
+            )
 
     def _thread_main(self) -> None:
         try:
@@ -678,6 +725,7 @@ class StadiaSessionWorker:
             follower.configure()
             self._raise_if_stop_requested()
             self.manager.mark_running(self.claim.session_id)
+            self._broadcast_joint_action(pose)
             loop_reason = self._run_control_loop(thermal_guard)
             if loop_reason is not None:
                 if not isinstance(loop_reason, str) or not loop_reason.strip():
@@ -927,6 +975,9 @@ class StadiaSessionWorker:
                 decision, healthy, _age, _reason = self._evaluate_snapshot(snapshot, now=now)
 
             movement_enabled = healthy and decision.motion_enabled and not self.claim.hold_requested.is_set()
+            with self._speed_lock:
+                self._movement_enabled = movement_enabled
+                effective_step = self.config.max_step_per_tick * self._speed_multiplier
             motion_state = MotionState.ENABLED if movement_enabled else MotionState.HOLD
             tick = scheduler.poll(now, ready=healthy)
             self._missed_ticks += tick.missed_ticks
@@ -936,24 +987,26 @@ class StadiaSessionWorker:
                         snapshot,
                         motion_enabled=movement_enabled,
                         deadzone=self.config.deadzone,
-                        max_step_per_tick=self.config.max_step_per_tick,
+                        max_step_per_tick=effective_step,
                         expected_guid=self.config.expected_guid,
                     )
-                    integrated = self._integrator.integrate_one_step(
-                        mapped.deltas_dict(),
-                        enabled=movement_enabled,
-                    )
+                    with self._speed_lock:
+                        integrated = self._integrator.integrate_one_step(
+                            mapped.deltas_dict(),
+                            enabled=movement_enabled,
+                        )
                     requested = integrated.action_dict()
                     if self._robot is None:
                         raise StadiaSessionRuntimeError("follower was not initialized")
                     returned_raw = self._robot.send_action(requested)
                     returned = validate_returned_action(returned_raw)
                     comparison = compare_requested_returned(requested, returned)
-                    self._integrator.accept_returned_action(
-                        comparison.adopted_action,
-                        requested_action=comparison.requested,
-                        tolerance=comparison.tolerance,
-                    )
+                    with self._speed_lock:
+                        self._integrator.accept_returned_action(
+                            comparison.adopted_action,
+                            requested_action=comparison.requested,
+                            tolerance=comparison.tolerance,
+                        )
                 except ActionValidationError:
                     raise
                 except Exception as error:
@@ -962,6 +1015,7 @@ class StadiaSessionWorker:
                     ) from error
                 self._commands_sent += 1
                 self._movement_steps += int(movement_enabled)
+                self._broadcast_joint_action(comparison.adopted_action.as_dict())
 
             self._publish_status(snapshot, motion_state)
             sleep_for = max(0.0, scheduler.next_deadline - self._now())
@@ -1083,6 +1137,8 @@ class StadiaSessionWorker:
             )
 
     def _integrator_specs(self) -> tuple[object, ...]:
+        with self._speed_lock:
+            effective_step = self.config.max_step_per_tick * self._speed_multiplier
         specs = []
         for spec in DEFAULT_JOINT_SPECS:
             travel = (
@@ -1094,7 +1150,7 @@ class StadiaSessionWorker:
                 type(spec)(
                     spec.action_key,
                     spec.unit,
-                    self.config.max_step_per_tick,
+                    effective_step,
                     travel,
                 )
             )
@@ -1105,6 +1161,8 @@ class StadiaSessionWorker:
         pose: Mapping[str, float],
         endpoint_bounds: Mapping[str, tuple[float, float]],
     ) -> tuple[JointStatusSpec, ...]:
+        with self._speed_lock:
+            effective_step = self.config.max_step_per_tick * self._speed_multiplier
         result = []
         for key in ACTION_KEYS:
             calibrated_lower, calibrated_upper = endpoint_bounds[key]
@@ -1121,7 +1179,7 @@ class StadiaSessionWorker:
                         if key == "gripper.pos"
                         else JointStatusUnit.DEGREES
                     ),
-                    max_step_per_tick=self.config.max_step_per_tick,
+                    max_step_per_tick=effective_step,
                     max_relative_target=MAX_RELATIVE_TARGET,
                     startup_min=max(calibrated_lower, pose[key] - travel),
                     startup_max=min(calibrated_upper, pose[key] + travel),
@@ -1130,6 +1188,31 @@ class StadiaSessionWorker:
                 )
             )
         return tuple(result)
+
+    def _speed_details(self) -> dict[str, float]:
+        return {
+            "stadia_speed_multiplier": self._speed_multiplier,
+            "stadia_effective_max_step_per_tick": (self.config.max_step_per_tick * self._speed_multiplier),
+        }
+
+    def _broadcast_joint_action(self, action: Mapping[str, float]) -> None:
+        if self._joint_broadcaster is None:
+            return
+        joints = {
+            urdf_name: float(action[action_key]) * math.pi / 180.0
+            for action_key, urdf_name in _ACTION_TO_URDF_JOINT.items()
+        }
+        try:
+            self._joint_broadcaster(
+                {
+                    "type": "joint_update",
+                    "joints": joints,
+                    "timestamp": time.time(),
+                }
+            )
+        except Exception:
+            # Visualization is advisory and must never perturb the device owner.
+            return
 
     def _publish_status(self, snapshot: StadiaSnapshot, motion_state: MotionState) -> None:
         decision = self._gate_decision
@@ -1189,6 +1272,7 @@ class StadiaSessionWorker:
             saturation_count=saturation,
             relative_clipping_count=clipping,
             thermal_snapshot=self._thermal,
+            details_patch=self._speed_details(),
         )
 
     def _publish_forced_controller_error(

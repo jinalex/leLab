@@ -812,6 +812,30 @@ class ControlSessionManager:
                 _details_json=_validated_details_json(merged),
             )
 
+    def update_joint_specs_and_details(
+        self,
+        session_id: str,
+        *,
+        joint_specs: tuple[JointStatusSpec, ...],
+        details_patch: Mapping[str, object],
+    ) -> ControlStatus:
+        """Atomically publish a live joint-cap change and its audit details."""
+
+        specs = _normalized_joint_specs(joint_specs)
+        patch = json.loads(_validated_details_json(details_patch))
+        with self._lock:
+            status = self._owned_status_locked(session_id)
+            if status.state is not ControlState.RUNNING:
+                raise InvalidControlTransitionError(
+                    "joint control settings can change only while a session is running"
+                )
+            details = status.details
+            details.update(patch)
+            return self._replace_active_locked(
+                joint_specs=specs,
+                _details_json=_validated_details_json(details),
+            )
+
     def update_runtime_status(
         self,
         session_id: str,

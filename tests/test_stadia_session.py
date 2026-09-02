@@ -388,6 +388,7 @@ def make_harness(
     lease_ttl_s: float = 1000.0,
     startup_timeout_s: float = 1.0,
     expected_guid: str | None = "stadia-guid",
+    joint_broadcaster: Callable[[Mapping[str, object]], None] | None = None,
 ) -> Harness:
     events: list[str] = []
     clock = FakeClock()
@@ -432,6 +433,7 @@ def make_harness(
         thermal_guard_factory=lambda selected_bus, _sleeper: (
             guard if selected_bus is bus else pytest.fail("wrong thermal bus")
         ),
+        joint_broadcaster=joint_broadcaster,
         clock=clock,
         sleeper=clock.sleep,
     )
@@ -689,6 +691,89 @@ def test_returned_clipping_is_counted_and_adopted_for_the_next_request() -> None
     assert result.movement_steps == 2
     assert harness.follower.sent_actions[0]["shoulder_pan.pos"] == pytest.approx(0.35)
     assert harness.follower.sent_actions[1]["shoulder_pan.pos"] == pytest.approx(0.45)
+
+
+def test_live_speed_change_requires_rb_release_and_updates_exact_joint_caps() -> None:
+    harness = make_harness(
+        runtime=[
+            stadia_snapshot(5, rb=False),
+            stadia_snapshot(6, rb=True, left_x=1.0),
+        ]
+    )
+    harness.follower.stop_after_sends = 2
+    harness.follower.send_hook = lambda count: (
+        harness.worker.set_speed_multiplier(2.0) if count == 1 else None
+    )
+
+    result = harness.worker.run()
+
+    assert result.movement_steps == 1
+    assert harness.follower.sent_actions[1]["shoulder_pan.pos"] == pytest.approx(0.7)
+    status = harness.manager.status_for("stadia-session", check_expiry=False)
+    assert status is not None
+    assert status.details["stadia_speed_multiplier"] == 2.0
+    assert status.details["stadia_effective_max_step_per_tick"] == pytest.approx(0.7)
+    assert all(spec.max_step_per_tick == pytest.approx(0.7) for spec in status.joint_specs)
+
+
+def test_live_speed_change_is_rejected_while_rb_enables_motion() -> None:
+    harness = make_harness(runtime=[stadia_snapshot(5, rb=True, left_x=1.0)])
+    errors: list[str] = []
+
+    def try_speed_change(_count: int) -> None:
+        try:
+            harness.worker.set_speed_multiplier(2.0)
+        except Exception as error:
+            errors.append(str(error))
+
+    harness.follower.send_hook = try_speed_change
+
+    result = harness.worker.run()
+
+    assert result.terminal_state is ControlState.STOPPED
+    assert errors == ["release RB before changing Stadia speed"]
+    assert harness.follower.sent_actions[0]["shoulder_pan.pos"] == pytest.approx(0.35)
+
+
+def test_authoritative_returned_actions_drive_the_urdf_broadcast() -> None:
+    broadcasts: list[Mapping[str, object]] = []
+    harness = make_harness(
+        runtime=[stadia_snapshot(5, rb=True, left_x=1.0)],
+        joint_broadcaster=broadcasts.append,
+    )
+
+    def clip(requested: dict[str, float]) -> dict[str, float]:
+        return {**requested, "shoulder_pan.pos": 0.1}
+
+    harness.follower.return_transforms = [clip]
+
+    result = harness.worker.run()
+
+    assert result.terminal_state is ControlState.STOPPED
+    assert len(broadcasts) == 2
+    assert broadcasts[0]["type"] == "joint_update"
+    assert broadcasts[0]["joints"] == pytest.approx(
+        {
+            "Rotation": 0.0,
+            "Pitch": 0.0,
+            "Elbow": 0.0,
+            "Wrist_Pitch": 0.0,
+            "Wrist_Roll": 0.0,
+            "Jaw": 50.0 * 3.141592653589793 / 180.0,
+        }
+    )
+    assert broadcasts[1]["joints"]["Rotation"] == pytest.approx(0.1 * 3.141592653589793 / 180.0)
+
+
+def test_visualizer_broadcast_failure_never_stops_the_device_owner() -> None:
+    harness = make_harness(
+        joint_broadcaster=lambda _payload: (_ for _ in ()).throw(RuntimeError("viewer gone"))
+    )
+
+    result = harness.worker.run()
+
+    assert result.terminal_state is ControlState.STOPPED
+    assert result.commands_sent == 1
 
 
 def test_rb_up_sends_an_intentional_hold_without_advancing_target() -> None:

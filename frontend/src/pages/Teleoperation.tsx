@@ -5,7 +5,23 @@ import TeleopCameraPanel from "@/components/control/TeleopCameraPanel";
 import ControlSessionPanel from "@/components/control/ControlSessionPanel";
 import { useToast } from "@/hooks/use-toast";
 import { useControlSession } from "@/hooks/useControlSession";
-import type { RobotOperation, TeleoperatorType } from "@/lib/robotConfig";
+import { useApi } from "@/contexts/ApiContext";
+import { Button } from "@/components/ui/button";
+import type { ControlStatus, RobotOperation, TeleoperatorType } from "@/lib/robotConfig";
+
+const MIN_STADIA_SPEED = 0.25;
+const MAX_STADIA_SPEED = 2;
+const STADIA_SPEED_STEP = 0.25;
+
+const statusSpeed = (status: ControlStatus | null): number | null => {
+  const value = status?.details.stadia_speed_multiplier;
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+};
+
+const statusEffectiveStep = (status: ControlStatus | null): number | null => {
+  const value = status?.details.stadia_effective_max_step_per_tick;
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+};
 
 interface TeleoperationNavigationState {
   session_id: string;
@@ -42,8 +58,12 @@ const TeleoperationPage = () => {
   const navigate = useNavigate();
   const location = useLocation();
   const { toast } = useToast();
+  const { baseUrl, fetchWithHeaders } = useApi();
   const navigation = parseNavigationState(location.state);
   const [leaveAfterStop, setLeaveAfterStop] = useState(false);
+  const [speedMultiplier, setSpeedMultiplier] = useState(1);
+  const [speedPending, setSpeedPending] = useState(false);
+  const [speedEditing, setSpeedEditing] = useState(false);
   const terminalToastRef = useRef(false);
 
   const control = useControlSession({
@@ -52,6 +72,11 @@ const TeleoperationPage = () => {
       (navigation?.operation ?? "leader_teleoperation") as RobotOperation,
     expectedTeleoperatorType: navigation?.teleoperator_type ?? null,
   });
+
+  useEffect(() => {
+    const reported = statusSpeed(control.status);
+    if (reported !== null && !speedPending && !speedEditing) setSpeedMultiplier(reported);
+  }, [control.status, speedPending, speedEditing]);
 
   useEffect(() => {
     if (navigation) return;
@@ -129,6 +154,57 @@ const TeleoperationPage = () => {
     }
   }, [navigation, control, navigate, toast]);
 
+  const applySpeed = useCallback(
+    async (requested: number) => {
+      if (!navigation || navigation.teleoperator_type !== "stadia") return;
+      const multiplier = Math.max(
+        MIN_STADIA_SPEED,
+        Math.min(MAX_STADIA_SPEED, Math.round(requested / STADIA_SPEED_STEP) * STADIA_SPEED_STEP),
+      );
+      const confirmed = statusSpeed(control.status);
+      if (confirmed === multiplier) {
+        setSpeedMultiplier(multiplier);
+        return;
+      }
+      setSpeedPending(true);
+      try {
+        const response = await fetchWithHeaders(`${baseUrl}/control-speed`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            session_id: navigation.session_id,
+            multiplier,
+          }),
+        });
+        const data: unknown = await response.json();
+        if (!response.ok) {
+          const message =
+            typeof (data as { message?: unknown })?.message === "string"
+              ? (data as { message: string }).message
+              : "Stadia speed could not be changed.";
+          throw new Error(message);
+        }
+        const adopted = control.ingestStatusEnvelope(data).status;
+        const reported = statusSpeed(adopted);
+        if (reported === null || reported !== multiplier) {
+          throw new Error("The backend did not confirm the requested Stadia speed.");
+        }
+        setSpeedMultiplier(reported);
+      } catch (error) {
+        setSpeedMultiplier(statusSpeed(control.status) ?? 1);
+        toast({
+          title: "Speed unchanged",
+          description:
+            error instanceof Error ? error.message : "Stadia speed could not be changed.",
+          variant: "destructive",
+        });
+      } finally {
+        setSpeedPending(false);
+      }
+    },
+    [navigation, control, fetchWithHeaders, baseUrl, toast],
+  );
+
   if (!navigation) return null;
 
   return (
@@ -139,6 +215,87 @@ const TeleoperationPage = () => {
           className="lg:w-full"
           rightSlot={
             <div className="flex h-full min-h-0 flex-col gap-4 overflow-y-auto">
+              {navigation.teleoperator_type === "stadia" && (
+                <div className="rounded-lg border border-slate-700 bg-slate-900/80 p-4 text-white">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <div className="text-sm font-medium text-slate-100">Stadia speed</div>
+                      <div className="text-xs text-slate-400">
+                        Release RB before changing speed.
+                      </div>
+                    </div>
+                    <div className="font-mono text-lg text-purple-300">
+                      {speedMultiplier.toFixed(2)}×
+                    </div>
+                  </div>
+                  <div className="mt-3 flex items-center gap-3">
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      aria-label="Decrease Stadia speed"
+                      disabled={
+                        speedPending ||
+                        control.status?.state !== "running" ||
+                        control.status.motion_state === "enabled" ||
+                        speedMultiplier <= MIN_STADIA_SPEED
+                      }
+                      onClick={() => void applySpeed(speedMultiplier - STADIA_SPEED_STEP)}
+                      className="border-slate-600 bg-slate-800"
+                    >
+                      −
+                    </Button>
+                    <input
+                      aria-label="Stadia speed multiplier"
+                      type="range"
+                      min={MIN_STADIA_SPEED}
+                      max={MAX_STADIA_SPEED}
+                      step={STADIA_SPEED_STEP}
+                      value={speedMultiplier}
+                      disabled={
+                        speedPending ||
+                        control.status?.state !== "running" ||
+                        control.status.motion_state === "enabled"
+                      }
+                      onPointerDown={() => setSpeedEditing(true)}
+                      onChange={(event) => setSpeedMultiplier(Number(event.target.value))}
+                      onPointerUp={(event) => {
+                        setSpeedEditing(false);
+                        void applySpeed(Number(event.currentTarget.value));
+                      }}
+                      onKeyDown={() => setSpeedEditing(true)}
+                      onKeyUp={(event) => {
+                        setSpeedEditing(false);
+                        void applySpeed(Number(event.currentTarget.value));
+                      }}
+                      className="h-2 flex-1 cursor-pointer accent-purple-500 disabled:cursor-not-allowed disabled:opacity-50"
+                    />
+                    <Button
+                      type="button"
+                      variant="outline"
+                      size="sm"
+                      aria-label="Increase Stadia speed"
+                      disabled={
+                        speedPending ||
+                        control.status?.state !== "running" ||
+                        control.status.motion_state === "enabled" ||
+                        speedMultiplier >= MAX_STADIA_SPEED
+                      }
+                      onClick={() => void applySpeed(speedMultiplier + STADIA_SPEED_STEP)}
+                      className="border-slate-600 bg-slate-800"
+                    >
+                      +
+                    </Button>
+                  </div>
+                  <div className="mt-2 flex justify-between text-[11px] text-slate-500">
+                    <span>{MIN_STADIA_SPEED.toFixed(2)}×</span>
+                    <span>
+                      {statusEffectiveStep(control.status)?.toFixed(2) ?? "—"}° / pp per tick
+                    </span>
+                    <span>{MAX_STADIA_SPEED.toFixed(2)}×</span>
+                  </div>
+                </div>
+              )}
               <ControlSessionPanel
                 status={control.status}
                 contractError={control.contractError}
