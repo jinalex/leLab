@@ -56,6 +56,10 @@ _inference_proc: subprocess.Popen | None = None
 _inference_started_at: float | None = None
 _inference_rollout_started_at: float | None = None
 _inference_meta: dict[str, Any] = {}
+_inference_pump_thread: threading.Thread | None = None
+# Retained until the next start so repeated status polls see the same natural
+# process failure instead of an indistinguishable idle state.
+_inference_terminal_status: dict[str, Any] | None = None
 # Guards mutations to the globals above; held only for the short critical
 # sections in start/stop/status.
 _state_lock = threading.Lock()
@@ -66,6 +70,90 @@ _HUB_ROOT_REF_RE = re.compile(r"^(?P<repo>[^@]+)@root$")
 # UI can present a "rollout time" separate from the multi-second policy
 # load + bus connect + camera connect setup overhead.
 _ROLLOUT_START_MARKER = "Rollout setup complete"
+
+
+def _process_has_exited(proc: subprocess.Popen) -> bool:
+    """Return true only when the child itself proves it has exited."""
+
+    try:
+        return proc.poll() is not None
+    except Exception as exc:
+        logger.exception("Failed to poll inference subprocess: %s", exc)
+        return False
+
+
+def _request_process_exit(proc: subprocess.Popen) -> bool:
+    """Try terminate then kill, returning only a proven child-exit result."""
+
+    if _process_has_exited(proc):
+        return True
+
+    try:
+        proc.terminate()
+    except Exception as exc:
+        logger.exception("Failed to terminate inference subprocess: %s", exc)
+
+    if not _process_has_exited(proc):
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            logger.warning("Inference subprocess did not exit after terminate")
+        except Exception as exc:
+            logger.exception("Failed while waiting for inference subprocess termination: %s", exc)
+
+    if not _process_has_exited(proc):
+        try:
+            proc.kill()
+        except Exception as exc:
+            logger.exception("Failed to kill inference subprocess: %s", exc)
+
+    if not _process_has_exited(proc):
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            logger.error("Inference subprocess did not exit after kill")
+        except Exception as exc:
+            logger.exception("Failed while waiting for killed inference subprocess: %s", exc)
+
+    return _process_has_exited(proc)
+
+
+def _close_process_streams(proc: subprocess.Popen) -> None:
+    for stream_name in ("stdin", "stdout", "stderr"):
+        stream = getattr(proc, stream_name, None)
+        if stream is not None:
+            with contextlib.suppress(Exception):
+                stream.close()
+
+
+def _join_pump_thread(pump: threading.Thread | None) -> tuple[bool, str | None]:
+    """Boundedly join the stdout/log owner and prove it released its handle."""
+
+    if pump is None:
+        return True, None
+    try:
+        pump.join(timeout=5)
+        if pump.is_alive():
+            return False, "inference stdout pump did not exit within 5 seconds"
+    except Exception as exc:
+        return False, f"inference stdout pump join failed: {type(exc).__name__}: {exc}"
+    return True, None
+
+
+def _terminate_failed_inference_start(proc: subprocess.Popen) -> bool:
+    """Boundedly stop a partially started child and prove whether it exited.
+
+    Streams are closed only after exit is proven. A still-running child keeps
+    all of its handles and must remain registered as the active owner so a
+    later stop request can retry cleanup.
+    """
+
+    exited = _request_process_exit(proc)
+    if exited:
+        _close_process_streams(proc)
+    else:
+        logger.error("Partially started inference subprocess may still be running")
+    return exited
 
 
 def _pump_stdout(proc: subprocess.Popen, log_handle) -> None:
@@ -191,14 +279,14 @@ def _format_cameras_arg(cameras: dict[str, dict[str, Any]]) -> str:
     """Convert {name: {type, camera_index, width, height, fps}} into
     lerobot's CLI dict syntax. The frontend key `camera_index` is
     remapped to lerobot's `index_or_path`."""
-    parts = []
+    remapped_cameras: dict[str, dict[str, Any]] = {}
     for name, cfg in cameras.items():
-        remapped = {
+        remapped_cameras[name] = {
             ("index_or_path" if k == "camera_index" else k): v for k, v in cfg.items() if v is not None
         }
-        body = ", ".join(f"{k}: {v}" for k, v in remapped.items())
-        parts.append(f"{name}: {{{body}}}")
-    return "{" + ", ".join(parts) + "}"
+    # JSON is valid YAML/Draccus input and, unlike hand-built mapping syntax,
+    # safely quotes aliases and string scalars that contain punctuation.
+    return json.dumps(remapped_cameras, separators=(",", ":"))
 
 
 # Exception lines at the tail of a Python traceback look like
@@ -292,7 +380,8 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
     """Start a one-shot rollout subprocess. Returns a dict — the route
     layer turns it into a JSON response or HTTPException as appropriate."""
     global inference_active, _inference_proc, _inference_started_at
-    global _inference_rollout_started_at, _inference_meta
+    global _inference_rollout_started_at, _inference_meta, _inference_pump_thread
+    global _inference_terminal_status
 
     # Mutex with teleop and recording: all three drive the same serial bus.
     from . import record as _record, teleoperate as _teleoperate
@@ -318,12 +407,17 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             }
         # Claim the slot now so a concurrent caller losing the race sees us.
         inference_active = True
+        _inference_terminal_status = None
 
     # Opened partway through setup; the stdout pump thread takes ownership once
     # it starts. Tracked here so a failure before that hand-off can close it
     # instead of leaking the file handle (which on Windows also keeps the log
     # locked).
     log_handle = None
+    proc: subprocess.Popen | None = None
+    pump_thread: threading.Thread | None = None
+    log_path: Path | None = None
+    spawned_at: float | None = None
     try:
         # `setup_follower_calibration_file` returns the basename without the
         # .json extension. We need that stripped form for `--robot.id`,
@@ -369,35 +463,86 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
             stderr=subprocess.STDOUT,
             env=env,
         )
+        spawned_at = time.time()
         try:
             assert proc.stdin is not None
             proc.stdin.write(b"\n")
             proc.stdin.flush()
             proc.stdin.close()
         except Exception as exc:
-            logger.warning("Failed to seed stdin for inference subprocess: %s", exc)
-        threading.Thread(
+            raise RuntimeError("failed to seed inference subprocess stdin") from exc
+        pump_thread = threading.Thread(
             target=_pump_stdout,
             args=(proc, log_handle),
             name="inference-stdout-pump",
             daemon=True,
-        ).start()
+        )
+        pump_thread.start()
         log_handle = None  # pump thread owns and closes it from here on
     except Exception as exc:
         logger.exception("Failed to start inference")
         # Startup failed before the pump thread took over (most often Popen
         # itself). Release the slot and close the log file if we opened it before
         # failing, so the handle isn't leaked.
+        exit_proven = proc is None or _terminate_failed_inference_start(proc)
         if log_handle is not None:
             log_handle.close()
+        error_text = f"Failed to start inference: {exc}"
+        failed_meta = {
+            "policy_ref": request.policy_ref,
+            "duration_s": request.duration_s,
+            "log_path": str(log_path) if log_path is not None else None,
+            "startup_error": error_text,
+        }
         with _state_lock:
-            inference_active = False
-        return {"success": False, "status_code": 500, "message": f"Failed to start inference: {exc}"}
+            if proc is not None and not exit_proven:
+                # Failure happened after Popen and bounded cleanup could not
+                # prove the child exited. Retain the exact process and active
+                # slot so the coordinator cannot release ownership; stop can
+                # retry termination later.
+                inference_active = True
+                _inference_proc = proc
+                _inference_started_at = spawned_at
+                _inference_rollout_started_at = None
+                _inference_meta = failed_meta
+                _inference_pump_thread = None
+            else:
+                inference_active = False
+                _inference_proc = None
+                _inference_started_at = None
+                _inference_rollout_started_at = None
+                _inference_meta = {}
+                _inference_pump_thread = None
+                _inference_terminal_status = {
+                    "inference_active": False,
+                    "exited": proc is not None,
+                    "exit_code": getattr(proc, "returncode", None) if proc is not None else None,
+                    "outcome": "failed",
+                    "error": error_text,
+                    "cleanup_pending": False,
+                    "hint": _friendly_hint(error_text),
+                    "policy_ref": request.policy_ref,
+                    "duration_s": request.duration_s,
+                    "log_path": failed_meta["log_path"],
+                    "started_at": spawned_at,
+                    "rollout_started_at": None,
+                    "rollout_elapsed_s": 0,
+                    "elapsed_s": 0,
+                    "startup_failed": True,
+                }
+        return {
+            "success": False,
+            "status_code": 500,
+            "message": error_text,
+            "stop_pending": not exit_proven,
+            "cleanup_proven": exit_proven,
+        }
 
     with _state_lock:
         _inference_proc = proc
         _inference_started_at = time.time()
         _inference_rollout_started_at = None
+        _inference_pump_thread = pump_thread
         _inference_meta = {
             "policy_ref": request.policy_ref,
             "duration_s": request.duration_s,
@@ -409,36 +554,100 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
 
 def handle_stop_inference() -> dict[str, Any]:
     global inference_active, _inference_proc, _inference_started_at
-    global _inference_rollout_started_at, _inference_meta
+    global _inference_rollout_started_at, _inference_meta, _inference_pump_thread
+    global _inference_terminal_status
 
     with _state_lock:
         if not inference_active or _inference_proc is None:
             return {"success": False, "status_code": 409, "message": "No inference is active"}
         proc = _inference_proc
+        meta = dict(_inference_meta)
+        started_at = _inference_started_at
+        rollout_started_at = _inference_rollout_started_at
+        pump_thread = _inference_pump_thread
+
+    already_exited = _process_has_exited(proc)
+    if not already_exited and not _request_process_exit(proc):
+        message = "Inference stop could not confirm that the subprocess exited"
+        with _state_lock:
+            # Do not clear an unproven process. Preserve ownership and enough
+            # evidence for status/UI callers; a later stop may retry.
+            if _inference_proc is proc:
+                inference_active = True
+                _inference_meta = {**_inference_meta, "stop_error": message}
+        return {
+            "success": False,
+            "status_code": 500,
+            "message": message,
+            "stop_pending": True,
+            "cleanup_proven": False,
+        }
+
+    pump_proven, pump_error = _join_pump_thread(pump_thread)
+    if not pump_proven:
+        message = pump_error or "Inference stdout pump cleanup could not be verified"
+        with _state_lock:
+            if _inference_proc is proc:
+                inference_active = True
+                _inference_meta = {**_inference_meta, "stop_error": message}
+        return {
+            "success": False,
+            "status_code": 500,
+            "message": message,
+            "stop_pending": True,
+            "cleanup_proven": False,
+        }
+    _close_process_streams(proc)
 
     try:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            logger.warning("Inference did not exit in 5s; killing")
-            proc.kill()
-            proc.wait()
-    except Exception as exc:
-        logger.exception("Stop inference: %s", exc)
+        exit_code = proc.poll()
+    except Exception:
+        # `_request_process_exit` just proved exit; fall back to Popen's cached
+        # returncode if a later poll call itself is flaky.
+        exit_code = getattr(proc, "returncode", None)
+
+    startup_error = meta.get("startup_error")
+    if startup_error:
+        outcome = "failed"
+        error = str(startup_error)
+    elif already_exited:
+        error = _extract_error_from_log(meta.get("log_path")) if exit_code else None
+        outcome = _classify_outcome(exit_code, rollout_started_at is not None, error)
+    else:
+        outcome = "stopped"
+        error = None
 
     with _state_lock:
-        inference_active = False
-        _inference_proc = None
-        _inference_started_at = None
-        _inference_rollout_started_at = None
-        _inference_meta = {}
-    return {"success": True, "message": "Inference stopped"}
+        if _inference_proc is proc:
+            inference_active = False
+            _inference_proc = None
+            _inference_started_at = None
+            _inference_rollout_started_at = None
+            _inference_meta = {}
+            _inference_pump_thread = None
+            _inference_terminal_status = {
+                "inference_active": False,
+                "exited": True,
+                "exit_code": exit_code,
+                "outcome": outcome,
+                "error": error,
+                "cleanup_pending": False,
+                "hint": _friendly_hint(error),
+                "policy_ref": meta.get("policy_ref"),
+                "duration_s": meta.get("duration_s"),
+                "log_path": meta.get("log_path"),
+                "started_at": started_at,
+                "rollout_started_at": rollout_started_at,
+                "rollout_elapsed_s": 0,
+                "elapsed_s": 0,
+            }
+    return {"success": True, "message": "Inference stopped", "cleanup_proven": True}
 
 
 def handle_inference_status() -> dict[str, Any]:
     global inference_active, _inference_proc, _inference_started_at
-    global _inference_rollout_started_at, _inference_meta
+    global _inference_rollout_started_at, _inference_meta, _inference_pump_thread
+    global _inference_terminal_status
 
     # Finalise state lazily if the subprocess died on its own.
     with _state_lock:
@@ -449,21 +658,44 @@ def handle_inference_status() -> dict[str, Any]:
             finished_meta = _inference_meta
             finished_started = _inference_started_at
             finished_rollout_started = _inference_rollout_started_at
+            pump_proven, pump_error = _join_pump_thread(_inference_pump_thread)
+            if not pump_proven:
+                inference_active = True
+                _inference_meta = {**_inference_meta, "pump_error": pump_error}
+                return {
+                    "inference_active": True,
+                    "exited": True,
+                    "exit_code": rc,
+                    "outcome": "failed",
+                    "error": pump_error,
+                    "cleanup_pending": True,
+                    "stop_pending": True,
+                    "policy_ref": finished_meta.get("policy_ref"),
+                    "duration_s": finished_meta.get("duration_s"),
+                    "log_path": finished_meta.get("log_path"),
+                    "started_at": finished_started,
+                    "rollout_started_at": finished_rollout_started,
+                    "rollout_elapsed_s": 0,
+                    "elapsed_s": 0,
+                }
+            _close_process_streams(proc)
             inference_active = False
             _inference_proc = None
             _inference_started_at = None
             _inference_rollout_started_at = None
             _inference_meta = {}
+            _inference_pump_thread = None
             # On failure, surface the real error from the log so the UI doesn't
             # have to send the user digging through the cache.
             error = _extract_error_from_log(finished_meta.get("log_path")) if rc else None
             outcome = _classify_outcome(rc, finished_rollout_started is not None, error)
-            return {
+            _inference_terminal_status = {
                 "inference_active": False,
                 "exited": True,
                 "exit_code": rc,
                 "outcome": outcome,
                 "error": error,
+                "cleanup_pending": False,
                 "hint": _friendly_hint(error),
                 "policy_ref": finished_meta.get("policy_ref"),
                 "duration_s": finished_meta.get("duration_s"),
@@ -473,10 +705,14 @@ def handle_inference_status() -> dict[str, Any]:
                 "rollout_elapsed_s": 0,
                 "elapsed_s": 0,
             }
+            return dict(_inference_terminal_status)
+        if proc is None and _inference_terminal_status is not None:
+            return dict(_inference_terminal_status)
         elapsed = (time.time() - _inference_started_at) if _inference_started_at else 0
         rollout_elapsed = time.time() - _inference_rollout_started_at if _inference_rollout_started_at else 0
-        return {
+        result = {
             "inference_active": inference_active,
+            "exited": False,
             "started_at": _inference_started_at,
             "rollout_started_at": _inference_rollout_started_at,
             "elapsed_s": elapsed,
@@ -485,3 +721,26 @@ def handle_inference_status() -> dict[str, Any]:
             "policy_ref": _inference_meta.get("policy_ref"),
             "log_path": _inference_meta.get("log_path"),
         }
+        startup_error = _inference_meta.get("startup_error")
+        if startup_error:
+            result.update(
+                {
+                    "outcome": "failed",
+                    "error": startup_error,
+                    "hint": _friendly_hint(str(startup_error)),
+                    "startup_failed": True,
+                    "stop_pending": True,
+                    "cleanup_pending": True,
+                }
+            )
+        else:
+            result.update(
+                {
+                    "outcome": "running" if inference_active else "idle",
+                    "error": None,
+                    "cleanup_pending": False,
+                }
+            )
+        if _inference_meta.get("stop_error"):
+            result["stop_error"] = _inference_meta["stop_error"]
+        return result

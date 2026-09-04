@@ -14,9 +14,11 @@ import UsageInstructionsModal from "@/components/landing/UsageInstructionsModal"
 import { useHfAuth } from "@/contexts/HfAuthContext";
 import { useRobots } from "@/hooks/useRobots";
 import { useDatasets } from "@/hooks/useDatasets";
-import { DatasetItem } from "@/lib/replayApi";
-import { CameraConfig } from "@/components/recording/CameraConfiguration";
+import type { DatasetItem } from "@/lib/replayApi";
+import type { CameraConfig } from "@/components/recording/CameraConfiguration";
 import { isHostedSpace } from "@/lib/isHostedSpace";
+import { readinessFor, recordingOperation } from "@/lib/robotConfig";
+import { makeStadiaDatasetRepoId } from "@/lib/recordingContract";
 
 const ON_SPACE = isHostedSpace();
 
@@ -29,6 +31,7 @@ const Landing = () => {
     selectedRecord,
     availableNames,
     isLoading: isLoadingRobots,
+    loadError: robotLoadError,
     selectRobot,
     createRobot,
     deleteRobot,
@@ -132,10 +135,13 @@ const Landing = () => {
       return;
     }
     const robot = selectedRecord;
-    if (!robot.is_clean) {
+    const readiness = readinessFor(robot, recordingOperation(robot));
+    if (!readiness.ready) {
       toast({
         title: "Robot not ready",
-        description: `${robot.name} is missing a calibration. Configure it before recording.`,
+        description:
+          readiness.issues.map((issue) => issue.message).join(" ") ||
+          `${robot.name} is not ready for recording.`,
         variant: "destructive",
       });
       return;
@@ -149,10 +155,30 @@ const Landing = () => {
       return;
     }
 
-    const datasetRepoId =
-      auth.status === "authenticated"
-        ? `${auth.username}/${datasetName}`
-        : datasetName;
+    let datasetRepoId: string;
+    if (robot.teleoperator_type === "stadia") {
+      const exactRepoId = makeStadiaDatasetRepoId(
+        auth.status === "authenticated" ? auth.username : null,
+        datasetName,
+      );
+      if (!exactRepoId) {
+        toast({
+          title: "Hugging Face sign-in required",
+          description:
+            "Stadia recording needs an authenticated username and a dataset name without slashes so the repository ID is exactly namespace/name.",
+          variant: "destructive",
+        });
+        return;
+      }
+      datasetRepoId = exactRepoId;
+    } else {
+      // Preserve the established leader-arm behavior, including local bare
+      // dataset names when the user is not authenticated.
+      datasetRepoId =
+        auth.status === "authenticated"
+          ? `${auth.username}/${datasetName}`
+          : datasetName;
+    }
 
     if (cameras.length > 0 && releaseStreamsRef.current) {
       console.log("🔓 Releasing camera streams before starting recording...");
@@ -177,7 +203,13 @@ const Landing = () => {
           camera_index: cam.camera_index,
           width: cam.width,
           height: cam.height,
-          fps: cam.fps,
+          // The Stadia worker compares this projection exactly with the
+          // canonical CameraRecord. A saved explicit null FPS must remain null;
+          // legacy leader recording keeps its historical omission behavior.
+          fps:
+            robot.teleoperator_type === "stadia"
+              ? (cam.fps ?? null)
+              : cam.fps,
           ...(cam.fourcc ? { fourcc: cam.fourcc } : {}),
           ...(cam.backend ? { backend: cam.backend } : {}),
         };
@@ -190,7 +222,7 @@ const Landing = () => {
           camera_index?: number;
           width: number;
           height: number;
-          fps?: number;
+          fps?: number | null;
           fourcc?: string;
           backend?: string;
         }
@@ -198,10 +230,7 @@ const Landing = () => {
     );
 
     const recordingConfig = {
-      leader_port: robot.leader_port,
-      follower_port: robot.follower_port,
-      leader_config: robot.leader_config,
-      follower_config: robot.follower_config,
+      robot_name: robot.name,
       dataset_repo_id: datasetRepoId,
       single_task: singleTask,
       num_episodes: numEpisodes,
@@ -216,7 +245,13 @@ const Landing = () => {
     };
 
     setShowRecordingModal(false);
-    navigate("/recording", { state: { recordingConfig } });
+    navigate("/recording", {
+      state: {
+        recordingConfig,
+        operation: recordingOperation(robot),
+        teleoperator_type: robot.teleoperator_type,
+      },
+    });
   };
 
   return (
@@ -236,6 +271,7 @@ const Landing = () => {
             selectedRecord={selectedRecord}
             availableNames={availableNames}
             isLoading={isLoadingRobots}
+            loadError={robotLoadError}
             selectRobot={selectRobot}
             createRobot={createRobot}
             deleteRobot={deleteRobot}

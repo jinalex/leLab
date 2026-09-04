@@ -61,7 +61,13 @@ export const loadMeshFile = (
     case "dae":
       new ColladaLoader(manager).load(
         path,
-        (result) => done(result.scene),
+        (result) => {
+          if (result === null) {
+            done(null, new Error(`Collada loader returned no scene: ${path}`));
+            return;
+          }
+          done(result.scene);
+        },
         undefined,
         (err) => done(null, err as Error)
       );

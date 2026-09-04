@@ -131,25 +131,36 @@ def _github_json(path: str) -> Any | None:
 def _is_uv_tool_install() -> bool:
     """True when LeLab runs from a `uv tool install` (the standard install).
 
-    uv tools live in an isolated env under `<data>/uv/tools/<name>/`, so the
-    running interpreter sits inside a `uv/tools` path segment.
+    uv writes the receipt into the tool environment itself. Checking the
+    receipt works for both the default directory and an explicit UV_TOOL_DIR;
+    matching a path fragment would misclassify valid isolated tool installs.
     """
-    return "uv/tools" in Path(sys.executable).as_posix()
+    return (Path(sys.prefix) / "uv-receipt.toml").is_file()
 
 
 def _build_update_cmd(owner: str, repo: str) -> list[str]:
     """Pick the right updater for how LeLab was installed.
 
-    - Standard install is `uv tool install`: update the tool in place with
-      `--force`, which re-fetches the latest commit even though the version
-      string is unchanged.
+    - Standard install is `uv tool install`: use `uv tool upgrade` so uv reads
+      the existing receipt and preserves the original requirements/settings.
+      Reinstall forces a Git refresh even though LeLab's version is unchanged,
+      and the explicit major/minor keeps the tool on its current Python line.
     - uv venv install: `uv pip install` pinned to this interpreter (uv venvs
       ship no pip), matching the extra-install flow in utils/system.py.
     - Plain pip env: `python -m pip install`.
     """
     target = f"git+https://github.com/{owner}/{repo}.git"
     if shutil.which("uv") and _is_uv_tool_install():
-        return ["uv", "tool", "install", "--force", target]
+        python_version = f"{sys.version_info.major}.{sys.version_info.minor}"
+        return [
+            "uv",
+            "tool",
+            "upgrade",
+            "--python",
+            python_version,
+            "--reinstall",
+            "lelab",
+        ]
     flags = ["--upgrade", "--force-reinstall", target]
     if shutil.which("uv"):
         return ["uv", "pip", "install", "--python", sys.executable, *flags]

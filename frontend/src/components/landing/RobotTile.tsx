@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { Settings, Trash2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { Alert, AlertDescription } from "@/components/ui/alert";
 import {
   Tooltip,
   TooltipContent,
@@ -14,7 +15,11 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@/components/ui/dialog";
-import { RobotRecord } from "@/hooks/useRobots";
+import type { RobotRecord } from "@/hooks/useRobots";
+import {
+  readinessFor,
+  teleoperationOperation,
+} from "@/lib/robotConfig";
 import RobotSelector from "./RobotSelector";
 
 interface RobotTileProps {
@@ -22,6 +27,7 @@ interface RobotTileProps {
   selectedName: string | null;
   availableNames: string[];
   isLoading: boolean;
+  loadError: string | null;
   onSelect: (name: string) => void;
   onCreateNew: (name: string) => Promise<boolean>;
   onConfigure: (name: string) => void;
@@ -34,6 +40,7 @@ const RobotTile: React.FC<RobotTileProps> = ({
   selectedName,
   availableNames,
   isLoading,
+  loadError,
   onSelect,
   onCreateNew,
   onConfigure,
@@ -41,11 +48,30 @@ const RobotTile: React.FC<RobotTileProps> = ({
   onDelete,
 }) => {
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const status = robot ? (robot.is_clean ? "Ready" : "Needs configuration") : null;
-  const teleopDisabled = !robot || !robot.is_clean;
+  const teleopReadiness = robot
+    ? readinessFor(robot, teleoperationOperation(robot))
+    : null;
+  const teleopDisabled = !teleopReadiness?.ready;
+  const status = robot
+    ? teleopReadiness?.ready
+      ? "Ready"
+      : "Needs configuration"
+    : null;
+  const modeLabel =
+    robot?.teleoperator_type === "stadia" ? "Stadia" : "Leader arm";
+  const unavailableReason = teleopReadiness?.issues
+    .map((issue) => issue.message)
+    .join(" ");
 
   return (
     <div className="bg-gray-800 rounded-lg border border-gray-700 p-3 flex flex-col gap-2 relative">
+      {loadError && (
+        <Alert className="border-red-700 bg-red-950/50 text-red-100">
+          <AlertDescription>
+            Robot list unavailable: {loadError}
+          </AlertDescription>
+        </Alert>
+      )}
       <div className="flex items-center gap-2">
         <div className="flex-1 min-w-0">
           <RobotSelector
@@ -59,10 +85,10 @@ const RobotTile: React.FC<RobotTileProps> = ({
         {status && (
           <p
             className={`text-xs truncate shrink-0 ${
-              robot!.is_clean ? "text-green-400" : "text-amber-400"
+              teleopReadiness?.ready ? "text-green-400" : "text-amber-400"
             }`}
           >
-            {status}
+            {modeLabel} · {status}
           </p>
         )}
         {robot && (
@@ -117,7 +143,9 @@ const RobotTile: React.FC<RobotTileProps> = ({
             </div>
           </TooltipTrigger>
           {teleopDisabled && (
-            <TooltipContent>Configure the robot first.</TooltipContent>
+            <TooltipContent>
+              {unavailableReason || "Configure the robot first."}
+            </TooltipContent>
           )}
         </Tooltip>
       )}

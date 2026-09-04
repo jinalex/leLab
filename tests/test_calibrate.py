@@ -49,6 +49,7 @@ def test_calibration_status_defaults_to_idle() -> None:
     assert status.device_type is None
     assert status.error is None
     assert status.step == 0
+    assert status.cleanup_pending is False
 
 
 def test_calibration_request_dataclass_round_trip() -> None:
@@ -84,6 +85,74 @@ def test_calibration_manager_get_status_when_idle_returns_status_object() -> Non
     assert s.status == "idle"
 
 
+def test_get_status_is_a_passive_deep_snapshot() -> None:
+    """HTTP polling must neither read the serial bus nor expose mutable state."""
+    from lelab.calibrate import CalibrationManager
+
+    class Bus:
+        def sync_read(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            raise AssertionError("status polling must not read the bus")
+
+    class Device:
+        bus = Bus()
+        is_connected = True
+
+    mgr = CalibrationManager()
+    mgr.device = Device()
+    mgr._update_status(
+        calibration_active=True,
+        status="recording",
+        current_positions={"joint": 100},
+        recorded_ranges={"joint": {"min": 90, "max": 110, "current": 100}},
+    )
+
+    snapshot = mgr.get_status()
+    snapshot.current_positions["joint"] = 999
+    snapshot.recorded_ranges["joint"]["max"] = 999
+
+    unchanged = mgr.get_status()
+    assert unchanged.current_positions == {"joint": 100}
+    assert unchanged.recorded_ranges == {"joint": {"min": 90, "max": 110, "current": 100}}
+
+
+def test_range_worker_publishes_positions_and_ranges_from_its_20hz_read(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lelab.calibrate import CalibrationManager
+
+    class Bus:
+        def __init__(self) -> None:
+            self.reads = iter(({"joint": 100}, {"joint": 250}))
+
+        def sync_read(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+            return next(self.reads)
+
+    class Device:
+        bus = Bus()
+
+    class OneIterationEvent:
+        def __init__(self) -> None:
+            self.checks = 0
+
+        def is_set(self) -> bool:
+            self.checks += 1
+            return self.checks > 1
+
+        def clear(self) -> None:
+            pass
+
+    mgr = CalibrationManager()
+    mgr.device = Device()
+    mgr._step_complete = OneIterationEvent()
+    monkeypatch.setattr("lelab.calibrate.time.sleep", lambda _seconds: None)
+
+    mgr._step_range_recording()
+
+    snapshot = mgr.get_status()
+    assert snapshot.current_positions == {"joint": 250}
+    assert snapshot.recorded_ranges == {"joint": {"min": 100, "max": 250, "current": 250}}
+
+
 def test_calibration_manager_rejects_double_start_via_message() -> None:
     """When calibration_active is True, start_calibration returns success=False."""
     from lelab.calibrate import CalibrationManager, CalibrationRequest
@@ -99,8 +168,7 @@ def test_calibration_manager_rejects_double_start_via_message() -> None:
 
 
 def test_cleanup_device_force_releases_and_clears_when_disconnect_fails() -> None:
-    """A failed device.disconnect() must still force-close the port and clear the
-    device handle — otherwise the COM port stays busy and blocks the next run."""
+    """A proven force-close clears the handle while retaining teardown error."""
     from lelab.calibrate import CalibrationManager
 
     class PortHandler:
@@ -117,11 +185,151 @@ def test_cleanup_device_force_releases_and_clears_when_disconnect_fails() -> Non
         def disconnect(self) -> None:
             raise RuntimeError("Failed to write 'Torque_Enable' on id_=6")
 
+        @property
+        def is_connected(self) -> bool:
+            return not self.bus.port_handler.closed
+
     mgr = CalibrationManager()
     device = Device()
     mgr.device = device
 
-    mgr._cleanup_device()
+    assert mgr._cleanup_device() is True
 
     assert device.bus.port_handler.closed is True  # force-released despite failure
     assert mgr.device is None  # handle cleared so a new calibration can start
+    assert "Torque_Enable" in (mgr._cleanup_error or "")
+
+
+def test_stop_timeout_never_disconnects_worker_owned_device() -> None:
+    from lelab.calibrate import CalibrationManager
+
+    class Device:
+        def __init__(self) -> None:
+            self.disconnect_calls = 0
+
+        def disconnect(self) -> None:
+            self.disconnect_calls += 1
+
+    class LingeringWorker:
+        def __init__(self) -> None:
+            self.join_calls: list[float | None] = []
+
+        def is_alive(self) -> bool:
+            return True
+
+        def join(self, timeout=None) -> None:  # type: ignore[no-untyped-def]
+            self.join_calls.append(timeout)
+
+    mgr = CalibrationManager()
+    device = Device()
+    worker = LingeringWorker()
+    mgr.device = device
+    mgr.calibration_thread = worker
+    mgr._update_status(calibration_active=True, status="recording")
+
+    result = mgr.stop_calibration_process()
+
+    assert result == {
+        "success": False,
+        "message": "Calibration stop requested, but the worker is still shutting down",
+        "stop_pending": True,
+        "cleanup_proven": False,
+    }
+    assert worker.join_calls == [5.0]
+    assert device.disconnect_calls == 0
+    assert mgr.device is device
+    assert mgr.get_status().calibration_active is True
+
+
+def test_stop_join_error_never_disconnects_worker_owned_device() -> None:
+    from lelab.calibrate import CalibrationManager
+
+    class Device:
+        def __init__(self) -> None:
+            self.disconnect_calls = 0
+
+        def disconnect(self) -> None:
+            self.disconnect_calls += 1
+
+    class BrokenWorker:
+        def is_alive(self) -> bool:
+            return True
+
+        def join(self, timeout=None) -> None:  # type: ignore[no-untyped-def]
+            raise RuntimeError("join failed")
+
+    mgr = CalibrationManager()
+    device = Device()
+    mgr.device = device
+    mgr.calibration_thread = BrokenWorker()
+    mgr._update_status(calibration_active=True, status="recording")
+
+    result = mgr.stop_calibration_process()
+
+    assert result == {
+        "success": False,
+        "message": "join failed",
+        "stop_pending": True,
+        "cleanup_proven": False,
+    }
+    assert device.disconnect_calls == 0
+    assert mgr.device is device
+
+
+def test_worker_natural_error_is_retained_across_status_polls(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from lelab.calibrate import CalibrationManager, CalibrationRequest
+
+    class Device:
+        def __init__(self) -> None:
+            self._connected = False
+
+        @property
+        def is_connected(self) -> bool:
+            return self._connected
+
+        def connect(self, *, calibrate: bool) -> None:
+            self._connected = True
+            raise RuntimeError("calibration bus failed")
+
+        def disconnect(self) -> None:
+            self._connected = False
+
+    mgr = CalibrationManager()
+    mgr._update_status(calibration_active=True, status="connecting")
+    monkeypatch.setattr("lelab.calibrate.make_teleoperator_from_config", lambda _config: Device())
+
+    mgr._calibration_worker(CalibrationRequest(device_type="teleop", port="COM_FAKE", config_file="fixture"))
+
+    first = mgr.get_status()
+    second = mgr.get_status()
+    assert first.status == second.status == "error"
+    assert first.error == second.error == "calibration bus failed"
+    assert first.calibration_active is second.calibration_active is False
+    assert first.cleanup_pending is second.cleanup_pending is False
+
+
+@pytest.mark.parametrize("postcondition", [True, None])
+def test_unproven_worker_cleanup_retains_device_and_active_ownership(postcondition: object) -> None:
+    from lelab.calibrate import CalibrationManager
+
+    class Device:
+        is_connected = postcondition
+
+        def disconnect(self) -> None:
+            pass
+
+    mgr = CalibrationManager()
+    device = Device()
+    mgr.device = device
+    mgr._update_status(calibration_active=True, status="recording")
+
+    mgr._cleanup_and_finish("done")
+
+    status = mgr.get_status()
+    assert mgr.device is device
+    assert status.calibration_active is True
+    assert status.status == "error"
+    assert status.cleanup_pending is True
+    assert "cleanup" in (status.error or "").lower()

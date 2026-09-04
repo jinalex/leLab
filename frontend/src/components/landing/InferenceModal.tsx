@@ -30,6 +30,7 @@ import {
   listJobCheckpoints,
 } from "@/lib/checkpointsApi";
 import { startInference } from "@/lib/inferenceApi";
+import { readinessFor } from "@/lib/robotConfig";
 import CheckpointDropdown from "@/components/jobs/CheckpointDropdown";
 import { useAvailableCameras } from "@/hooks/useAvailableCameras";
 import { useCameraStream } from "@/hooks/useCameraStream";
@@ -67,8 +68,6 @@ interface Props {
   jobId: string;
   initialStep: number | null;
 }
-
-const DEFAULT_FPS = 30;
 
 const InferenceModal: React.FC<Props> = ({
   open,
@@ -155,9 +154,9 @@ const InferenceModal: React.FC<Props> = ({
     };
   }, [open, baseUrl, fetchWithHeaders, jobId, selectedStep]);
 
-  // If the selected robot has cameras whose names match a policy-expected
-  // camera, auto-bind them. Prefer matching by browser device_id (stable
-  // across cv2 index drift); fall back to the saved camera_index.
+  // If the selected robot has an available saved camera whose name matches a
+  // policy feature, bind its saved index. Inference never substitutes an
+  // arbitrary detected camera for the canonical robot configuration.
   useEffect(() => {
     if (!policyConfig) return;
     const robotCams = robot?.cameras ?? [];
@@ -171,10 +170,14 @@ const InferenceModal: React.FC<Props> = ({
           (c) => c.name.toLowerCase() === policyName.toLowerCase(),
         );
         if (!robotCam) continue;
-        const live =
-          (robotCam.device_id &&
-            availableCameras.find((c) => c.deviceId === robotCam.device_id)) ||
-          availableCameras.find((c) => c.index === robotCam.camera_index);
+        const live = availableCameras.find(
+          (camera) =>
+            camera.available &&
+            camera.index === robotCam.camera_index &&
+            (!robotCam.device_id ||
+              !camera.deviceId ||
+              camera.deviceId === robotCam.device_id),
+        );
         if (live) {
           next[policyName] = live.index;
           changed = true;
@@ -192,13 +195,41 @@ const InferenceModal: React.FC<Props> = ({
   const expectedCameraNames = policyConfig
     ? Object.keys(policyConfig.image_features)
     : [];
-  const allCamerasBound = expectedCameraNames.every(
-    (name) => cameraBindings[name] != null,
+  const savedCameraOptions = (robot?.cameras ?? []).flatMap((saved) => {
+    if (saved.camera_index == null) return [];
+    const live = availableCameras.find(
+      (camera) =>
+        camera.available &&
+        camera.index === saved.camera_index &&
+        (!saved.device_id ||
+          !camera.deviceId ||
+          camera.deviceId === saved.device_id),
+    );
+    return live ? [{ saved, live }] : [];
+  });
+  const boundCameraIndexes = expectedCameraNames.map(
+    (name) => cameraBindings[name],
   );
+  const allCamerasBound =
+    new Set(boundCameraIndexes).size === boundCameraIndexes.length &&
+    expectedCameraNames.every((name) => {
+    const index = cameraBindings[name];
+    const dims = policyConfig?.image_features[name];
+    const option = savedCameraOptions.find(
+      ({ saved }) => saved.camera_index === index,
+    );
+    return Boolean(
+      option &&
+        dims &&
+        option.saved.width === dims.width &&
+        option.saved.height === dims.height,
+    );
+    });
+  const inferenceReadiness = robot ? readinessFor(robot, "inference") : null;
 
   const canStart =
     !!robot &&
-    robot.is_clean &&
+    inferenceReadiness?.ready === true &&
     selectedRef != null &&
     !!policyConfig &&
     allCamerasBound &&
@@ -212,30 +243,36 @@ const InferenceModal: React.FC<Props> = ({
     setSubmitting(true);
     await new Promise((r) => setTimeout(r, 300));
     const cameraDict: Record<string, {
-      type: string; camera_index?: number; width: number; height: number; fps?: number;
+      type: "opencv"; camera_index: number; width: number; height: number; fps?: number;
     }> = {};
-    for (const [name, dims] of Object.entries(policyConfig.image_features)) {
+    for (const name of Object.keys(policyConfig.image_features)) {
       const idx = cameraBindings[name];
       if (idx == null) continue;
+      const saved = robot.cameras.find((camera) => camera.camera_index === idx);
+      if (!saved || saved.camera_index == null) continue;
       cameraDict[name] = {
         type: "opencv",
-        camera_index: idx,
-        width: dims.width,
-        height: dims.height,
-        fps: DEFAULT_FPS,
+        camera_index: saved.camera_index,
+        width: saved.width,
+        height: saved.height,
+        ...(saved.fps === undefined ? {} : { fps: saved.fps }),
       };
     }
     try {
-      await startInference(baseUrl, fetchWithHeaders, {
-        follower_port: robot.follower_port,
-        follower_config: robot.follower_config,
+      const result = await startInference(baseUrl, fetchWithHeaders, {
+        robot_name: robot.name,
         policy_ref: selectedRef,
         task,
         cameras: cameraDict,
         duration_s: durationS,
-      });
+      }, robot.teleoperator_type);
       onOpenChange(false);
-      navigate("/inference");
+      navigate("/inference", {
+        state: {
+          session_id: result.session_id,
+          teleoperator_type: robot.teleoperator_type,
+        },
+      });
     } catch (e) {
       toast({
         title: "Couldn't start inference",
@@ -283,12 +320,13 @@ const InferenceModal: React.FC<Props> = ({
                   Select and configure a robot on the Landing page first.
                 </AlertDescription>
               </Alert>
-            ) : !robot.is_clean ? (
+            ) : !inferenceReadiness?.ready ? (
               <Alert className="bg-amber-900/40 border-amber-700 text-amber-100">
                 <AlertTriangle className="h-4 w-4" />
                 <AlertDescription>
-                  <strong>{robot.name}</strong> is missing a calibration.
-                  Configure it before running inference.
+                  <strong>{robot.name}</strong> is not ready for inference. {inferenceReadiness?.issues
+                    .map((issue) => issue.message)
+                    .join(" ")}
                 </AlertDescription>
               </Alert>
             ) : (
@@ -381,16 +419,17 @@ const InferenceModal: React.FC<Props> = ({
             ) : (
               <div className="space-y-3">
                 <p className="text-xs text-gray-500">
-                  Bind a physical camera to each name the policy was trained
-                  with. Resolution comes from the checkpoint.
+                  Bind a saved robot camera to each name the policy was trained
+                  with. Its saved resolution must match the checkpoint; update
+                  the camera on the Calibration page if it has changed.
                 </p>
                 {expectedCameraNames.map((name) => {
                   const dims = policyConfig.image_features[name];
                   const value = cameraBindings[name];
-                  const bound =
-                    value != null
-                      ? availableCameras.find((c) => c.index === value)
-                      : undefined;
+                  const option = savedCameraOptions.find(
+                    ({ saved }) => saved.camera_index === value,
+                  );
+                  const bound = option?.live;
                   return (
                     <div key={name} className="flex items-center gap-3">
                       <div className="flex-1">
@@ -409,17 +448,17 @@ const InferenceModal: React.FC<Props> = ({
                           <SelectValue placeholder="Select a camera" />
                         </SelectTrigger>
                         <SelectContent className="bg-gray-900 border-gray-700 text-white">
-                          {availableCameras.length === 0 ? (
+                          {savedCameraOptions.length === 0 ? (
                             <div className="px-2 py-1.5 text-xs text-gray-500">
-                              No cameras detected
+                              No saved robot cameras are available
                             </div>
                           ) : (
-                            availableCameras.map((cam) => (
+                            savedCameraOptions.map(({ saved, live }) => (
                               <SelectItem
-                                key={cam.index}
-                                value={String(cam.index)}
+                                key={saved.id}
+                                value={String(saved.camera_index)}
                               >
-                                #{cam.index} — {cam.name}
+                                #{saved.camera_index} — {saved.name} ({live.name})
                               </SelectItem>
                             ))
                           )}
