@@ -80,6 +80,10 @@ class TriggerNeutralState:
     exercised: bool = False
     released: bool = False
     requires_exercise: bool = False
+    signed_range_seen: bool = False
+    zero_baseline_learned: bool = False
+    zero_release_learned: bool = False
+    stable_zero_samples: int = 0
 
 
 @dataclass(frozen=True)

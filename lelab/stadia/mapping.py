@@ -25,6 +25,9 @@ DPAD_UP_BUTTON = 11
 DPAD_DOWN_BUTTON = 12
 DPAD_LEFT_BUTTON = 13
 DPAD_RIGHT_BUTTON = 14
+TRIGGER_RELEASED_THRESHOLD = -0.85
+TRIGGER_FULL_PRESS_THRESHOLD = 0.85
+TRIGGER_ZERO_TOLERANCE = 0.05
 
 
 class StadiaProfileError(ValueError):
@@ -85,32 +88,102 @@ def _dpad_y(snapshot: StadiaSnapshot) -> int:
     return int(snapshot.button(DPAD_UP_BUTTON)) - int(snapshot.button(DPAD_DOWN_BUTTON))
 
 
-def _observe_trigger(value: float, previous: TriggerNeutralState) -> TriggerNeutralState:
-    """Require a full exercise/release cycle after an ambiguous midpoint."""
+def _observe_trigger(
+    value: float,
+    previous: TriggerNeutralState,
+    *,
+    sequence_advanced: bool,
+    stable_samples_required: int,
+) -> TriggerNeutralState:
+    """Learn either a signed -1 rest or an exercised, stable zero rest."""
 
     value = float(value)
     if not math.isfinite(value):
+        raise ValueError("trigger value must be finite")
+    if not -1.0 <= value <= 1.0:
+        raise ValueError("trigger value must be in [-1, 1]")
+
+    if not sequence_advanced:
+        if previous.signed_range_seen:
+            released = previous.released and value <= TRIGGER_RELEASED_THRESHOLD
+        elif previous.zero_release_learned:
+            released = previous.released and abs(value) <= TRIGGER_ZERO_TOLERANCE
+        else:
+            released = False
         return TriggerNeutralState(
             exercised=previous.exercised,
-            released=False,
-            requires_exercise=True,
+            released=released,
+            requires_exercise=previous.requires_exercise,
+            signed_range_seen=previous.signed_range_seen,
+            zero_baseline_learned=previous.zero_baseline_learned,
+            zero_release_learned=previous.zero_release_learned,
+            stable_zero_samples=previous.stable_zero_samples,
         )
-    if value <= -0.85:
+
+    if value <= TRIGGER_RELEASED_THRESHOLD:
+        # A definite -1-style rest makes raw zero ambiguous as a possible
+        # half-press for the remainder of this connection generation.
         return TriggerNeutralState(
             exercised=previous.exercised,
             released=not previous.requires_exercise or previous.exercised,
             requires_exercise=previous.requires_exercise,
+            signed_range_seen=True,
         )
-    if value >= 0.85:
+    if value >= TRIGGER_FULL_PRESS_THRESHOLD:
         return TriggerNeutralState(
             exercised=True,
             released=False,
             requires_exercise=previous.requires_exercise,
+            signed_range_seen=previous.signed_range_seen,
+            zero_baseline_learned=previous.zero_baseline_learned,
+            zero_release_learned=previous.zero_release_learned,
         )
+
+    if abs(value) <= TRIGGER_ZERO_TOLERANCE and not previous.signed_range_seen:
+        # First learn a stable zero candidate without releasing. Then require a
+        # full press and a second stable-zero streak before accepting that rest.
+        if previous.zero_release_learned:
+            stable_zero_samples = min(previous.stable_zero_samples + 1, stable_samples_required)
+            return TriggerNeutralState(
+                exercised=previous.exercised,
+                released=previous.exercised and stable_zero_samples >= stable_samples_required,
+                requires_exercise=True,
+                zero_baseline_learned=True,
+                zero_release_learned=True,
+                stable_zero_samples=stable_zero_samples,
+            )
+
+        if not previous.zero_baseline_learned:
+            stable_zero_samples = 1 if previous.exercised else previous.stable_zero_samples + 1
+            stable_zero_samples = min(stable_zero_samples, stable_samples_required)
+            return TriggerNeutralState(
+                released=False,
+                requires_exercise=True,
+                zero_baseline_learned=stable_zero_samples >= stable_samples_required,
+                stable_zero_samples=stable_zero_samples,
+            )
+
+        stable_zero_samples = previous.stable_zero_samples
+        if previous.exercised:
+            stable_zero_samples = min(stable_zero_samples + 1, stable_samples_required)
+        learned = previous.exercised and stable_zero_samples >= stable_samples_required
+        return TriggerNeutralState(
+            exercised=previous.exercised,
+            released=learned,
+            requires_exercise=True,
+            zero_baseline_learned=True,
+            zero_release_learned=learned,
+            stable_zero_samples=stable_zero_samples,
+        )
+
+    signed_range_seen = previous.signed_range_seen or value < -TRIGGER_ZERO_TOLERANCE
     return TriggerNeutralState(
         exercised=previous.exercised,
         released=False,
         requires_exercise=True,
+        signed_range_seen=signed_range_seen,
+        zero_baseline_learned=previous.zero_baseline_learned and not signed_range_seen,
+        zero_release_learned=previous.zero_release_learned and not signed_range_seen,
     )
 
 
@@ -141,9 +214,20 @@ class NeutralReleaseGate:
             failed_state = NeutralGateState(connection_generation=state.connection_generation)
             return NeutralGateDecision(failed_state, False, False, False, str(error))
 
-        left_trigger = _observe_trigger(snapshot.axis(LEFT_TRIGGER_AXIS), state.left_trigger)
-        right_trigger = _observe_trigger(snapshot.axis(RIGHT_TRIGGER_AXIS), state.right_trigger)
+        sequence_advanced = state.last_sequence is None or snapshot.sequence > state.last_sequence
         try:
+            left_trigger = _observe_trigger(
+                snapshot.axis(LEFT_TRIGGER_AXIS),
+                state.left_trigger,
+                sequence_advanced=sequence_advanced,
+                stable_samples_required=self.stable_samples_required,
+            )
+            right_trigger = _observe_trigger(
+                snapshot.axis(RIGHT_TRIGGER_AXIS),
+                state.right_trigger,
+                sequence_advanced=sequence_advanced,
+                stable_samples_required=self.stable_samples_required,
+            )
             sticks_neutral = all(
                 rescaled_deadzone(snapshot.axis(index), self.deadzone) == 0.0
                 for index in (LEFT_X_AXIS, LEFT_Y_AXIS, RIGHT_X_AXIS, RIGHT_Y_AXIS)
@@ -152,16 +236,24 @@ class NeutralReleaseGate:
             failed_state = NeutralGateState(connection_generation=state.connection_generation)
             return NeutralGateDecision(failed_state, False, False, False, str(error))
         dpad_neutral = _dpad_x(snapshot) == 0 and _dpad_y(snapshot) == 0
-        triggers_released = left_trigger.released and right_trigger.released
+        trigger_modes_match = (left_trigger.signed_range_seen and right_trigger.signed_range_seen) or (
+            left_trigger.zero_release_learned and right_trigger.zero_release_learned
+        )
+        trigger_mode_conflict = (
+            state.left_trigger.zero_release_learned and left_trigger.signed_range_seen
+        ) or (state.right_trigger.zero_release_learned and right_trigger.signed_range_seen)
+        triggers_released = left_trigger.released and right_trigger.released and trigger_modes_match
         controls_neutral = sticks_neutral and dpad_neutral and triggers_released
         rb_held = snapshot.button(RB_BUTTON)
 
-        sequence_advanced = state.last_sequence is None or snapshot.sequence > state.last_sequence
         last_sequence = snapshot.sequence if sequence_advanced else state.last_sequence
         release_seen = state.release_seen or (sequence_advanced and not rb_held)
         neutral_armed = state.neutral_armed
         stable_neutral_samples = state.stable_neutral_samples
-        if not rb_held:
+        if not trigger_modes_match or trigger_mode_conflict:
+            stable_neutral_samples = 0
+            neutral_armed = False
+        elif not rb_held:
             if controls_neutral:
                 if sequence_advanced:
                     stable_neutral_samples = min(
@@ -174,7 +266,14 @@ class NeutralReleaseGate:
                 neutral_armed = False
         elif not neutral_armed:
             stable_neutral_samples = 0
-        motion_enabled = release_seen and neutral_armed and rb_held and not generation_changed
+        motion_enabled = (
+            release_seen
+            and neutral_armed
+            and rb_held
+            and trigger_modes_match
+            and not trigger_mode_conflict
+            and not generation_changed
+        )
 
         next_state = NeutralGateState(
             connection_generation=snapshot.connection_generation,
@@ -217,6 +316,8 @@ def map_stadia_input(
     if not math.isfinite(max_step_per_tick) or max_step_per_tick <= 0:
         raise ValueError("max_step_per_tick must be finite and positive")
 
+    left_trigger_raw = snapshot.axis(LEFT_TRIGGER_AXIS)
+    right_trigger_raw = snapshot.axis(RIGHT_TRIGGER_AXIS)
     inputs = (
         ("left_x", rescaled_deadzone(snapshot.axis(LEFT_X_AXIS), deadzone)),
         ("left_y", -rescaled_deadzone(snapshot.axis(LEFT_Y_AXIS), deadzone)),
@@ -224,17 +325,23 @@ def map_stadia_input(
         ("right_y", -rescaled_deadzone(snapshot.axis(RIGHT_Y_AXIS), deadzone)),
         ("dpad_x", float(_dpad_x(snapshot))),
         ("dpad_y", float(_dpad_y(snapshot))),
-        ("left_trigger", normalize_signed_trigger(snapshot.axis(LEFT_TRIGGER_AXIS))),
-        ("right_trigger", normalize_signed_trigger(snapshot.axis(RIGHT_TRIGGER_AXIS))),
+        ("left_trigger", normalize_signed_trigger(left_trigger_raw)),
+        ("right_trigger", normalize_signed_trigger(right_trigger_raw)),
     )
     values = dict(inputs)
     scale = max_step_per_tick if motion_enabled and snapshot.button(RB_BUTTON) else 0.0
+    triggers_share_rest = (
+        left_trigger_raw <= TRIGGER_RELEASED_THRESHOLD and right_trigger_raw <= TRIGGER_RELEASED_THRESHOLD
+    ) or (
+        abs(left_trigger_raw) <= TRIGGER_ZERO_TOLERANCE and abs(right_trigger_raw) <= TRIGGER_ZERO_TOLERANCE
+    )
+    gripper_input = 0.0 if triggers_share_rest else values["left_trigger"] - values["right_trigger"]
     deltas = (
-        ("shoulder_pan.pos", values["left_x"] * scale),
+        ("shoulder_pan.pos", -values["left_x"] * scale),
         ("shoulder_lift.pos", values["left_y"] * scale),
         ("elbow_flex.pos", values["right_y"] * scale),
         ("wrist_flex.pos", values["right_x"] * scale),
         ("wrist_roll.pos", values["dpad_x"] * scale),
-        ("gripper.pos", (values["left_trigger"] - values["right_trigger"]) * scale),
+        ("gripper.pos", gripper_input * scale),
     )
     return MappedStadiaInput(inputs, deltas)

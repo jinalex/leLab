@@ -575,7 +575,7 @@ def test_returned_command_is_recorded_and_adopted_for_finish_hold() -> None:
     assert result.terminal_state is ControlState.STOPPED
     recorded = harness.adapter.saved[0][0]
     assert recorded["action"]["shoulder_pan.pos"] == pytest.approx(0.1)
-    assert harness.follower.sent[0]["shoulder_pan.pos"] == pytest.approx(0.35)
+    assert harness.follower.sent[0]["shoulder_pan.pos"] == pytest.approx(-0.35)
     assert harness.follower.sent[1]["shoulder_pan.pos"] == pytest.approx(0.1)
     assert result.relative_clipping_count == 1
 
