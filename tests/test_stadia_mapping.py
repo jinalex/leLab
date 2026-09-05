@@ -563,7 +563,7 @@ def test_deadzone_axis_signs_and_stadia_button_layout_match_reference() -> None:
     )
     assert mapped.deltas_dict() == pytest.approx(
         {
-            "shoulder_pan.pos": -0.2,
+            "shoulder_pan.pos": 0.2,
             "shoulder_lift.pos": 0.2,
             "elbow_flex.pos": 0.2,
             "wrist_flex.pos": 0.2,
@@ -575,9 +575,9 @@ def test_deadzone_axis_signs_and_stadia_button_layout_match_reference() -> None:
 
 @pytest.mark.parametrize(
     ("left_x", "expected_pan_delta"),
-    [(0.575, -0.2), (-0.575, 0.2)],
+    [(0.575, 0.2), (-0.575, -0.2)],
 )
-def test_shoulder_pan_inverts_left_stick_horizontal_axis(
+def test_shoulder_pan_preserves_left_stick_horizontal_axis(
     left_x: float,
     expected_pan_delta: float,
 ) -> None:

@@ -337,7 +337,7 @@ def map_stadia_input(
     )
     gripper_input = 0.0 if triggers_share_rest else values["left_trigger"] - values["right_trigger"]
     deltas = (
-        ("shoulder_pan.pos", -values["left_x"] * scale),
+        ("shoulder_pan.pos", values["left_x"] * scale),
         ("shoulder_lift.pos", values["left_y"] * scale),
         ("elbow_flex.pos", values["right_y"] * scale),
         ("wrist_flex.pos", values["right_x"] * scale),
