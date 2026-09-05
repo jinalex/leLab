@@ -280,13 +280,7 @@ const validStadiaSettings = (settings: StadiaConfig): boolean =>
   settings.deadzone < 1 &&
   Number.isFinite(settings.max_step_per_tick) &&
   settings.max_step_per_tick > 0 &&
-  settings.max_step_per_tick <= 0.35 &&
-  Number.isFinite(settings.arm_startup_travel_degrees) &&
-  settings.arm_startup_travel_degrees > 0 &&
-  settings.arm_startup_travel_degrees <= 45 &&
-  Number.isFinite(settings.gripper_startup_travel_percentage_points) &&
-  settings.gripper_startup_travel_percentage_points > 0 &&
-  settings.gripper_startup_travel_percentage_points <= 45;
+  settings.max_step_per_tick <= 0.35;
 
 const yesNoUnknown = (value: boolean | null | undefined): string =>
   value == null ? "Unknown" : value ? "Yes" : "No";
@@ -1024,7 +1018,7 @@ const Calibration = () => {
       if (!saved) throw new Error("The robot record no longer exists.");
       toast({
         title: "Stadia settings saved",
-        description: "Units and safety bounds were saved to this robot.",
+        description: "Controller identity, deadzone, and max step were saved.",
       });
     } catch (error) {
       toast({
@@ -1412,69 +1406,11 @@ const Calibration = () => {
                         className="bg-slate-700 border-slate-600 text-white"
                       />
                     </div>
-                    <div className="space-y-2">
-                      <Label htmlFor="stadiaArmTravel" className="text-xs text-slate-300">
-                        Arm startup travel (degrees)
-                      </Label>
-                      <NumberInput
-                        id="stadiaArmTravel"
-                        integer={false}
-                        min="0.1"
-                        max="45"
-                        step="0.5"
-                        value={robot.stadia.arm_startup_travel_degrees}
-                        onChange={(value) => {
-                          if (value === undefined) return;
-                          setRobot((current) =>
-                            current
-                              ? {
-                                  ...current,
-                                  stadia: {
-                                    ...current.stadia,
-                                    arm_startup_travel_degrees: value,
-                                  },
-                                }
-                              : current
-                          );
-                        }}
-                        className="bg-slate-700 border-slate-600 text-white"
-                      />
-                    </div>
-                    <div className="space-y-2">
-                      <Label htmlFor="stadiaGripTravel" className="text-xs text-slate-300">
-                        Gripper startup travel (pp)
-                      </Label>
-                      <NumberInput
-                        id="stadiaGripTravel"
-                        integer={false}
-                        min="0.1"
-                        max="45"
-                        step="0.5"
-                        value={
-                          robot.stadia.gripper_startup_travel_percentage_points
-                        }
-                        onChange={(value) => {
-                          if (value === undefined) return;
-                          setRobot((current) =>
-                            current
-                              ? {
-                                  ...current,
-                                  stadia: {
-                                    ...current.stadia,
-                                    gripper_startup_travel_percentage_points:
-                                      value,
-                                  },
-                                }
-                              : current
-                          );
-                        }}
-                        className="bg-slate-700 border-slate-600 text-white"
-                      />
-                    </div>
                   </div>
                   <p className="text-xs text-slate-500">
+                    Stadia movement is bounded by the follower&apos;s calibrated endpoints.
                     The follower also applies a fixed 5 degree / 5 percentage-point
-                    relative-target limit per command.
+                    relative-target limit to each command.
                   </p>
                   {!stadiaSettingsAreValid && (
                     <Alert className="bg-red-900/40 border-red-700 text-red-100">

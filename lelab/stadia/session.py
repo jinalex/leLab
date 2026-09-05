@@ -99,8 +99,6 @@ class StadiaSessionConfig:
     expected_guid: str | None = None
     deadzone: float = 0.15
     max_step_per_tick: float = 0.35
-    arm_startup_travel_degrees: float = 45.0
-    gripper_startup_travel_percentage_points: float = 45.0
     startup_timeout_s: float = 5.0
     reader_join_timeout_s: float = 2.0
     torque_disable_attempts: int = 2
@@ -131,18 +129,6 @@ class StadiaSessionConfig:
 
         self._finite_range("deadzone", self.deadzone, lower=0.0, upper=1.0, upper_inclusive=False)
         self._finite_range("max_step_per_tick", self.max_step_per_tick, lower=0.0, upper=0.35)
-        self._finite_range(
-            "arm_startup_travel_degrees",
-            self.arm_startup_travel_degrees,
-            lower=0.0,
-            upper=45.0,
-        )
-        self._finite_range(
-            "gripper_startup_travel_percentage_points",
-            self.gripper_startup_travel_percentage_points,
-            lower=0.0,
-            upper=45.0,
-        )
         self._finite_range("startup_timeout_s", self.startup_timeout_s, lower=0.0)
         self._finite_range("reader_join_timeout_s", self.reader_join_timeout_s, lower=0.0)
         if (
@@ -686,7 +672,7 @@ class StadiaSessionWorker:
             prearm_snapshot = self._wait_for_prearm_confirmation(startup_snapshot)
             self._raise_if_stop_requested()
 
-            # Read the anchor only after every potentially blocking setup step.
+            # Read the initial target only after every potentially blocking setup step.
             # Raw validation must precede LeRobot's normalization so an invalid
             # RANGE_0_100 value cannot be hidden by its endpoint clamp.
             raw_pose = bus.sync_read(
@@ -700,11 +686,10 @@ class StadiaSessionWorker:
             validated_raw_pose, pose = _normalize_raw_pose(raw_pose, position_scales)
             self._integrator = BoundedStadiaIntegrator(
                 initial_action=pose,
-                startup_anchor=pose,
                 endpoint_bounds=endpoint_bounds,
                 specs=self._integrator_specs(),
             )
-            self._joint_status_specs = self._status_specs(pose, endpoint_bounds)
+            self._joint_status_specs = self._status_specs(endpoint_bounds)
             self._raise_if_stop_requested()
 
             for motor in SO101_MOTOR_NAMES:
@@ -1141,24 +1126,17 @@ class StadiaSessionWorker:
             effective_step = self.config.max_step_per_tick * self._speed_multiplier
         specs = []
         for spec in DEFAULT_JOINT_SPECS:
-            travel = (
-                self.config.gripper_startup_travel_percentage_points
-                if spec.action_key == "gripper.pos"
-                else self.config.arm_startup_travel_degrees
-            )
             specs.append(
                 type(spec)(
                     spec.action_key,
                     spec.unit,
                     effective_step,
-                    travel,
                 )
             )
         return tuple(specs)
 
     def _status_specs(
         self,
-        pose: Mapping[str, float],
         endpoint_bounds: Mapping[str, tuple[float, float]],
     ) -> tuple[JointStatusSpec, ...]:
         with self._speed_lock:
@@ -1166,11 +1144,6 @@ class StadiaSessionWorker:
         result = []
         for key in ACTION_KEYS:
             calibrated_lower, calibrated_upper = endpoint_bounds[key]
-            travel = (
-                self.config.gripper_startup_travel_percentage_points
-                if key == "gripper.pos"
-                else self.config.arm_startup_travel_degrees
-            )
             result.append(
                 JointStatusSpec(
                     action_key=key,
@@ -1181,8 +1154,6 @@ class StadiaSessionWorker:
                     ),
                     max_step_per_tick=effective_step,
                     max_relative_target=MAX_RELATIVE_TARGET,
-                    startup_min=max(calibrated_lower, pose[key] - travel),
-                    startup_max=min(calibrated_upper, pose[key] + travel),
                     calibrated_min=calibrated_lower,
                     calibrated_max=calibrated_upper,
                 )

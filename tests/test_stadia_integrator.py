@@ -8,7 +8,6 @@ from lelab.stadia.integrator import BoundedStadiaIntegrator, validate_returned_a
 from lelab.stadia.types import (
     ACTION_KEYS,
     DEFAULT_JOINT_SPECS,
-    JointControlSpec,
     PositionUnit,
 )
 
@@ -28,7 +27,6 @@ def integrator(initial: float = 0.0) -> BoundedStadiaIntegrator:
     initial_action["gripper.pos"] = max(0.0, initial)
     return BoundedStadiaIntegrator(
         initial_action=initial_action,
-        startup_anchor=initial_action,
         endpoint_bounds=bounds(),
     )
 
@@ -37,7 +35,6 @@ def test_default_specs_use_explicit_degrees_and_gripper_percentage_points() -> N
     assert [spec.unit for spec in DEFAULT_JOINT_SPECS[:5]] == [PositionUnit.DEGREES] * 5
     assert DEFAULT_JOINT_SPECS[5].unit is PositionUnit.GRIPPER_PERCENTAGE_POINTS
     assert {spec.max_step_per_tick for spec in DEFAULT_JOINT_SPECS} == {0.35}
-    assert {spec.startup_travel for spec in DEFAULT_JOINT_SPECS} == {45.0}
 
 
 def test_integrates_no_more_than_one_clamped_step_and_counts_saturation() -> None:
@@ -56,30 +53,40 @@ def test_disabled_integrator_holds_without_advancing() -> None:
     assert control.target == action(10.0)
 
 
-def test_startup_travel_and_calibrated_endpoint_clamps_are_counted() -> None:
-    small_specs = tuple(
-        JointControlSpec(spec.action_key, spec.unit, 0.35, 0.2) for spec in DEFAULT_JOINT_SPECS
-    )
+@pytest.mark.parametrize(
+    ("direction", "expected_arm", "expected_gripper"),
+    [(1.0, 180.0, 100.0), (-1.0, -180.0, 0.0)],
+)
+def test_full_calibrated_range_replaces_startup_anchor_envelope(
+    direction: float,
+    expected_arm: float,
+    expected_gripper: float,
+) -> None:
     start = action(0.0)
+    start["gripper.pos"] = 50.0
     control = BoundedStadiaIntegrator(
         initial_action=start,
-        startup_anchor=start,
         endpoint_bounds=bounds(),
-        specs=small_specs,
     )
-    travel = control.integrate_one_step(action(0.35), enabled=True)
-    assert set(travel.action_dict().values()) == {0.2}
-    assert travel.counters.travel_saturations == 6
+    crossed_former_envelope = False
+    result = None
+    for _ in range(700):
+        result = control.integrate_one_step(action(direction * 0.35), enabled=True)
+        values = result.action_dict()
+        assert all(-180.0 <= values[key] <= 180.0 for key in ACTION_KEYS[:5])
+        assert 0.0 <= values["gripper.pos"] <= 100.0
+        crossed_former_envelope |= (
+            abs(values["shoulder_pan.pos"]) > 45.0
+            and abs(values["gripper.pos"] - start["gripper.pos"]) > 45.0
+        )
 
-    endpoint_bounds = bounds(-0.1, 0.1)
-    endpoint_bounds["gripper.pos"] = (0.0, 0.1)
-    endpoint = BoundedStadiaIntegrator(
-        initial_action=start,
-        startup_anchor=start,
-        endpoint_bounds=endpoint_bounds,
-    ).integrate_one_step(action(0.35), enabled=True)
-    assert set(endpoint.action_dict().values()) == {0.1}
-    assert endpoint.counters.endpoint_saturations == 6
+    assert result is not None
+    values = result.action_dict()
+    assert crossed_former_envelope
+    assert {values[key] for key in ACTION_KEYS[:5]} == {expected_arm}
+    assert values["gripper.pos"] == expected_gripper
+    assert result.counters.travel_saturations == 0
+    assert result.counters.endpoint_saturations > 0
 
 
 def test_gripper_is_always_clamped_to_zero_through_one_hundred() -> None:
@@ -87,7 +94,6 @@ def test_gripper_is_always_clamped_to_zero_through_one_hundred() -> None:
     start["gripper.pos"] = 99.9
     control = BoundedStadiaIntegrator(
         initial_action=start,
-        startup_anchor=start,
         endpoint_bounds=bounds(),
     )
     result = control.integrate_one_step(action(0.35), enabled=True)

@@ -61,7 +61,6 @@ class JointControlSpec:
     action_key: str
     unit: PositionUnit
     max_step_per_tick: float = 0.35
-    startup_travel: float = 45.0
 
 
 DEFAULT_JOINT_SPECS = (

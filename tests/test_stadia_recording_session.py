@@ -33,7 +33,7 @@ from lelab.stadia.recording_session import (
     build_stadia_recording_worker,
     resolve_recording_repo_id,
 )
-from lelab.stadia.session import StadiaSessionConfig
+from lelab.stadia.session import StadiaSessionConfig, derive_calibrated_endpoint_bounds
 from lelab.stadia.thermal_safety import ConfirmedTemperatureStopError, ThermalSnapshot
 from lelab.stadia.types import ACTION_KEYS, STADIA_PRODUCT_NAME, ControllerLayout, StadiaSnapshot
 
@@ -58,12 +58,13 @@ def snapshot(
     clock: FakeClock,
     rb: bool = False,
     left_x: float = 0.0,
+    triggers: tuple[float, float] = (-1.0, -1.0),
     connected: bool = True,
     sampled_at: float | None = None,
     generation: int = 1,
     read_error: str | None = None,
 ) -> StadiaSnapshot:
-    axes = (left_x, 0.0, 0.0, 0.0, -1.0, -1.0) if connected else ()
+    axes = (left_x, 0.0, 0.0, 0.0, *triggers) if connected else ()
     buttons = [False] * 15 if connected else []
     if connected:
         buttons[10] = rb
@@ -580,6 +581,60 @@ def test_returned_command_is_recorded_and_adopted_for_finish_hold() -> None:
     assert result.relative_clipping_count == 1
 
 
+@pytest.mark.parametrize(
+    ("direction", "left_x", "triggers", "endpoint_index"),
+    [
+        (1.0, -1.0, (1.0, -1.0), 1),
+        (-1.0, 1.0, (-1.0, 1.0), 0),
+    ],
+)
+def test_recording_travels_beyond_former_anchor_envelope_to_calibrated_endpoints(
+    direction: float,
+    left_x: float,
+    triggers: tuple[float, float],
+    endpoint_index: int,
+) -> None:
+    sample_clock = FakeClock()
+    runtime = [
+        snapshot(
+            sequence,
+            clock=sample_clock,
+            rb=True,
+            left_x=left_x,
+            triggers=triggers,
+        )
+        for sequence in range(5, 306)
+    ]
+    harness = make_harness(
+        runtime=runtime,
+        episode_time_s=100.0,
+        advances=[1 / 30] * len(runtime),
+    )
+    harness.pacer_hooks[len(runtime)] = lambda: harness.worker.finish_episode()
+    endpoint_bounds = derive_calibrated_endpoint_bounds(harness.follower)
+
+    result = harness.worker.run()
+
+    assert result.terminal_state is ControlState.STOPPED
+    assert harness.adapter.finalize_calls == 1
+    saved_actions = [frame["action"] for frame in harness.adapter.saved[0]]
+    assert len(saved_actions) == len(runtime) - 1
+    assert any(
+        direction * action["shoulder_pan.pos"] > 45.0 and direction * (action["gripper.pos"] - 50.0) > 45.0
+        for action in saved_actions
+    )
+    assert saved_actions[-1]["shoulder_pan.pos"] == (endpoint_bounds["shoulder_pan.pos"][endpoint_index])
+    assert saved_actions[-1]["gripper.pos"] == endpoint_bounds["gripper.pos"][endpoint_index]
+    for action in saved_actions:
+        for key in ("shoulder_pan.pos", "gripper.pos"):
+            lower, upper = endpoint_bounds[key]
+            assert lower <= action[key] <= upper
+    loop = harness.worker.recording_result
+    assert loop is not None
+    assert loop.counters.travel_saturations == 0
+    assert loop.counters.endpoint_saturations > 0
+
+
 def test_rb_up_with_deflected_stick_is_a_valid_recorded_hold() -> None:
     clock = FakeClock()
     harness = make_harness(
@@ -922,8 +977,6 @@ def ready_record() -> object:
             guid=None,
             deadzone=0.15,
             max_step_per_tick=0.35,
-            arm_startup_travel_degrees=45.0,
-            gripper_startup_travel_percentage_points=45.0,
         ),
         cameras=[
             SimpleNamespace(

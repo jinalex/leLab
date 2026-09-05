@@ -147,6 +147,56 @@ def test_only_explicit_null_clears_the_unused_leader(_isolated_robot_records: Pa
     assert record.leader is None
 
 
+def test_legacy_stadia_travel_fields_load_without_writing_and_strip_on_save(
+    _isolated_robot_records: Path,
+) -> None:
+    from lelab.utils import config as cfg
+
+    path = _isolated_robot_records / "stadia.json"
+    legacy_v2 = {
+        "schema_version": 2,
+        "name": "stadia",
+        "teleoperator_type": "stadia",
+        "follower": {"port": "/dev/follower", "calibration": "follower.json"},
+        "leader": None,
+        "stadia": {
+            "guid": "stadia-guid",
+            "deadzone": 0.15,
+            "max_step_per_tick": 0.35,
+            "arm_startup_travel_degrees": 30.0,
+            "gripper_startup_travel_percentage_points": 40.0,
+        },
+        "cameras": [],
+    }
+    original = json.dumps(legacy_v2, indent=2)
+    path.write_text(original)
+
+    loaded = cfg.get_robot_record_v2("stadia")
+
+    assert loaded is not None
+    assert loaded.teleoperator_type == "stadia"
+    assert loaded.stadia.model_dump(mode="json") == {
+        "guid": "stadia-guid",
+        "deadzone": 0.15,
+        "max_step_per_tick": 0.35,
+    }
+    assert path.read_text() == original
+
+    saved = cfg.save_robot_record_v2(
+        "stadia",
+        {"schema_version": 2, "stadia": {"deadzone": 0.2}},
+        allow_create=False,
+    )
+
+    assert saved is not None
+    persisted_stadia = json.loads(path.read_text())["stadia"]
+    assert persisted_stadia == {
+        "guid": "stadia-guid",
+        "deadzone": 0.2,
+        "max_step_per_tick": 0.35,
+    }
+
+
 @pytest.mark.parametrize("value", [float("nan"), float("inf"), float("-inf")])
 def test_stadia_numeric_settings_reject_nonfinite_values(value: float) -> None:
     from pydantic import ValidationError

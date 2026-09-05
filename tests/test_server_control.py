@@ -134,8 +134,6 @@ def _v2_record(*, mode: str = "stadia") -> dict[str, Any]:
             "guid": "030000005e040000ea02000000000000",
             "deadzone": 0.15,
             "max_step_per_tick": 0.35,
-            "arm_startup_travel_degrees": 45.0,
-            "gripper_startup_travel_percentage_points": 45.0,
         },
         "cameras": [],
     }

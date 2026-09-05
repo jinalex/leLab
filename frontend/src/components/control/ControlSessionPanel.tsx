@@ -344,7 +344,7 @@ const ControlSessionPanel = ({
                     <th className="px-2 py-2">Joint</th>
                     <th className="px-2 py-2">Unit</th>
                     <th className="px-2 py-2">Step / relative</th>
-                    <th className="px-2 py-2">Startup / calibrated bounds</th>
+                    <th className="px-2 py-2">Calibrated bounds</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -356,7 +356,7 @@ const ControlSessionPanel = ({
                         {spec.max_step_per_tick} / {spec.max_relative_target}
                       </td>
                       <td className="px-2 py-2">
-                        {spec.startup_min}…{spec.startup_max} / {spec.calibrated_min}…{spec.calibrated_max}
+                        {spec.calibrated_min}…{spec.calibrated_max}
                       </td>
                     </tr>
                   ))}
