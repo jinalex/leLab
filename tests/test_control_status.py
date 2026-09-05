@@ -57,8 +57,6 @@ def joint_specs() -> tuple[JointStatusSpec, ...]:
             ),
             max_step_per_tick=0.35,
             max_relative_target=5.0,
-            startup_min=0.0 if key == "gripper.pos" else -45.0,
-            startup_max=100.0 if key == "gripper.pos" else 45.0,
             calibrated_min=0.0 if key == "gripper.pos" else -90.0,
             calibrated_max=100.0 if key == "gripper.pos" else 90.0,
         )
@@ -173,6 +171,8 @@ def test_runtime_contract_fields_are_typed_atomic_and_json_safe() -> None:
     assert payload["controller_error"] is None
     assert payload["controller_layout"] == {"axes": 6, "buttons": 17, "hats": 0}
     assert payload["joint_limits"]["gripper.pos"]["calibrated_max"] == 100.0
+    assert "startup_min" not in payload["joint_limits"]["gripper.pos"]
+    assert "startup_max" not in payload["joint_specs"][-1]
     assert payload["thermal_snapshot"]["temperatures"]["gripper"] == 42.0
     json.dumps(payload, allow_nan=False)
 

@@ -31,7 +31,6 @@ class BoundedStadiaIntegrator:
         self,
         *,
         initial_action: Mapping[str, float],
-        startup_anchor: Mapping[str, float],
         endpoint_bounds: Mapping[str, tuple[float, float]],
         specs: Sequence[JointControlSpec] = DEFAULT_JOINT_SPECS,
     ) -> None:
@@ -40,15 +39,10 @@ class BoundedStadiaIntegrator:
         if self.keys != ACTION_KEYS:
             raise ValueError(f"specs must define exactly {list(ACTION_KEYS)} in order")
         if any(
-            not math.isfinite(spec.max_step_per_tick)
-            or spec.max_step_per_tick <= 0
-            or not math.isfinite(spec.startup_travel)
-            or spec.startup_travel <= 0
-            for spec in self.specs
+            not math.isfinite(spec.max_step_per_tick) or spec.max_step_per_tick <= 0 for spec in self.specs
         ):
-            raise ValueError("step and startup-travel limits must be finite and positive")
+            raise ValueError("step limits must be finite and positive")
         self.target = _exact_finite_values(initial_action, self.keys, "initial action")
-        self.anchor = _exact_finite_values(startup_anchor, self.keys, "startup anchor")
         if set(endpoint_bounds) != set(self.keys) or len(endpoint_bounds) != len(self.keys):
             raise ValueError(f"endpoint bounds must contain exactly {list(self.keys)}")
         self.endpoint_bounds: dict[str, tuple[float, float]] = {}
@@ -75,7 +69,7 @@ class BoundedStadiaIntegrator:
 
     def integrate_one_step(self, deltas: Mapping[str, float], *, enabled: bool) -> IntegrationResult:
         values = _exact_finite_values(deltas, self.keys, "joint deltas")
-        step_saturations = travel_saturations = endpoint_saturations = 0
+        step_saturations = endpoint_saturations = 0
         requested: dict[str, float] = {}
         for spec in self.specs:
             key = spec.action_key
@@ -83,20 +77,19 @@ class BoundedStadiaIntegrator:
             bounded_delta = max(-spec.max_step_per_tick, min(spec.max_step_per_tick, delta))
             step_saturations += int(bounded_delta != delta)
             candidate = self.target[key] + bounded_delta
-            travel_lower = self.anchor[key] - spec.startup_travel
-            travel_upper = self.anchor[key] + spec.startup_travel
-            travel_target = max(travel_lower, min(travel_upper, candidate))
-            travel_saturations += int(travel_target != candidate)
             lower, upper = self.endpoint_bounds[key]
             if key == "gripper.pos":
                 lower, upper = max(0.0, lower), min(100.0, upper)
-            final_target = max(lower, min(upper, travel_target))
-            endpoint_saturations += int(final_target != travel_target)
+            final_target = max(lower, min(upper, candidate))
+            endpoint_saturations += int(final_target != candidate)
             requested[key] = final_target
 
         self.counters = IntegratorCounters(
             step_saturations=self.counters.step_saturations + step_saturations,
-            travel_saturations=self.counters.travel_saturations + travel_saturations,
+            # Retained as a zero-valued compatibility counter for existing
+            # recording/status audit structures. Stadia no longer has a
+            # startup-anchor travel envelope.
+            travel_saturations=self.counters.travel_saturations,
             endpoint_saturations=self.counters.endpoint_saturations + endpoint_saturations,
             returned_clippings=self.counters.returned_clippings,
         )

@@ -23,8 +23,6 @@ export interface StadiaConfig {
   guid: string | null;
   deadzone: number;
   max_step_per_tick: number;
-  arm_startup_travel_degrees: number;
-  gripper_startup_travel_percentage_points: number;
 }
 
 export interface RobotCameraRecord {
@@ -118,8 +116,6 @@ export interface ControllerLayout {
 export interface JointLimit {
   max_step_per_tick: number;
   max_relative_target: number;
-  startup_min: number;
-  startup_max: number;
   calibrated_min: number;
   calibrated_max: number;
 }
@@ -299,15 +295,14 @@ const parseDevice = (value: unknown): RobotDeviceRecord | null => {
 };
 
 const parseStadia = (value: unknown): StadiaConfig | null => {
+  const required = ["guid", "deadzone", "max_step_per_tick"];
+  const legacyTravelKeys = [
+    "arm_startup_travel_degrees",
+    "gripper_startup_travel_percentage_points",
+  ];
   if (
     !isObject(value) ||
-    !exactKeys(value, [
-      "guid",
-      "deadzone",
-      "max_step_per_tick",
-      "arm_startup_travel_degrees",
-      "gripper_startup_travel_percentage_points",
-    ])
+    !exactKeys(value, required, legacyTravelKeys)
   ) {
     return null;
   }
@@ -321,12 +316,11 @@ const parseStadia = (value: unknown): StadiaConfig | null => {
     !finiteNumber(value.max_step_per_tick) ||
     value.max_step_per_tick <= 0 ||
     value.max_step_per_tick > 0.35 ||
-    !finiteNumber(value.arm_startup_travel_degrees) ||
-    value.arm_startup_travel_degrees <= 0 ||
-    value.arm_startup_travel_degrees > 45 ||
-    !finiteNumber(value.gripper_startup_travel_percentage_points) ||
-    value.gripper_startup_travel_percentage_points <= 0 ||
-    value.gripper_startup_travel_percentage_points > 45
+    legacyTravelKeys.some(
+      (key) =>
+        Object.prototype.hasOwnProperty.call(value, key) &&
+        (!finiteNumber(value[key]) || value[key] <= 0 || value[key] > 45),
+    )
   ) {
     return null;
   }
@@ -334,9 +328,6 @@ const parseStadia = (value: unknown): StadiaConfig | null => {
     guid,
     deadzone: value.deadzone,
     max_step_per_tick: value.max_step_per_tick,
-    arm_startup_travel_degrees: value.arm_startup_travel_degrees,
-    gripper_startup_travel_percentage_points:
-      value.gripper_startup_travel_percentage_points,
   };
 };
 
@@ -685,21 +676,29 @@ const parseTorque = (value: unknown): TorqueEvidence | null => {
 };
 
 const parseJointLimit = (value: unknown): JointLimit | null => {
-  const keys = [
-    "max_step_per_tick",
-    "max_relative_target",
-    "startup_min",
-    "startup_max",
-    "calibrated_min",
-    "calibrated_max",
-  ];
-  if (!isObject(value) || !exactKeys(value, keys) || keys.some((key) => !finiteNumber(value[key]))) {
+  const keys = ["max_step_per_tick", "max_relative_target", "calibrated_min", "calibrated_max"];
+  const legacyKeys = ["startup_min", "startup_max"];
+  if (
+    !isObject(value) ||
+    !exactKeys(value, keys, legacyKeys) ||
+    keys.some((key) => !finiteNumber(value[key]))
+  ) {
+    return null;
+  }
+  const hasLegacyMin = Object.prototype.hasOwnProperty.call(value, "startup_min");
+  const hasLegacyMax = Object.prototype.hasOwnProperty.call(value, "startup_max");
+  if (
+    hasLegacyMin !== hasLegacyMax ||
+    (hasLegacyMin &&
+      (!finiteNumber(value.startup_min) ||
+        !finiteNumber(value.startup_max) ||
+        value.startup_min > value.startup_max))
+  ) {
     return null;
   }
   if (
     (value.max_step_per_tick as number) <= 0 ||
     (value.max_relative_target as number) <= 0 ||
-    (value.startup_min as number) > (value.startup_max as number) ||
     (value.calibrated_min as number) > (value.calibrated_max as number)
   ) {
     return null;
@@ -707,8 +706,6 @@ const parseJointLimit = (value: unknown): JointLimit | null => {
   return {
     max_step_per_tick: value.max_step_per_tick as number,
     max_relative_target: value.max_relative_target as number,
-    startup_min: value.startup_min as number,
-    startup_max: value.startup_max as number,
     calibrated_min: value.calibrated_min as number,
     calibrated_max: value.calibrated_max as number,
   };
@@ -753,18 +750,24 @@ const parseJointEvidence = (
     limits[actionKey] = limit;
   }
   for (const rawSpec of rawSpecs) {
+    const hasLegacyStartupBounds =
+      isObject(rawSpec) &&
+      (Object.prototype.hasOwnProperty.call(rawSpec, "startup_min") ||
+        Object.prototype.hasOwnProperty.call(rawSpec, "startup_max"));
     if (
       !isObject(rawSpec) ||
-      !exactKeys(rawSpec, [
-        "action_key",
-        "unit",
-        "max_step_per_tick",
-        "max_relative_target",
-        "startup_min",
-        "startup_max",
-        "calibrated_min",
-        "calibrated_max",
-      ]) ||
+      !exactKeys(
+        rawSpec,
+        [
+          "action_key",
+          "unit",
+          "max_step_per_tick",
+          "max_relative_target",
+          "calibrated_min",
+          "calibrated_max",
+        ],
+        ["startup_min", "startup_max"],
+      ) ||
       typeof rawSpec.action_key !== "string" ||
       !ACTION_KEYS.has(rawSpec.action_key) ||
       typeof rawSpec.unit !== "string" ||
@@ -776,10 +779,14 @@ const parseJointEvidence = (
     const limit = parseJointLimit({
       max_step_per_tick: rawSpec.max_step_per_tick,
       max_relative_target: rawSpec.max_relative_target,
-      startup_min: rawSpec.startup_min,
-      startup_max: rawSpec.startup_max,
       calibrated_min: rawSpec.calibrated_min,
       calibrated_max: rawSpec.calibrated_max,
+      ...(hasLegacyStartupBounds
+        ? {
+            startup_min: rawSpec.startup_min,
+            startup_max: rawSpec.startup_max,
+          }
+        : {}),
     });
     if (!limit || specsByKey.has(actionKey)) return null;
     if (rawSpec.unit !== units[actionKey]) return null;

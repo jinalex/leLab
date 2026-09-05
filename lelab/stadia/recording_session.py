@@ -1054,8 +1054,6 @@ def build_stadia_recording_worker(
             expected_guid=record.stadia.guid,
             deadzone=record.stadia.deadzone,
             max_step_per_tick=record.stadia.max_step_per_tick,
-            arm_startup_travel_degrees=record.stadia.arm_startup_travel_degrees,
-            gripper_startup_travel_percentage_points=(record.stadia.gripper_startup_travel_percentage_points),
             cameras=canonical_cameras,
         ),
         recording_config=recording_config,

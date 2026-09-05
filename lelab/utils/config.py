@@ -442,21 +442,41 @@ class CameraRecord(BaseModel):
 
 
 class StadiaConfig(BaseModel):
-    """Persisted, user-selectable Stadia settings with plan-owned safety caps."""
+    """Persisted Stadia settings with compatibility-only legacy travel fields."""
 
     model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
 
     guid: str | None = None
     deadzone: float = Field(default=0.15, ge=0.0, lt=1.0)
     max_step_per_tick: float = Field(default=0.35, gt=0.0, le=0.35)
-    arm_startup_travel_degrees: float = Field(default=45.0, gt=0.0, le=45.0)
-    gripper_startup_travel_percentage_points: float = Field(default=45.0, gt=0.0, le=45.0)
+    # RobotRecord V2 files created before removal of the Stadia startup
+    # envelope may contain these keys. Accept and validate them on input, but
+    # do not expose or persist them again: calibrated endpoints are now the
+    # only travel bounds used by Stadia teleoperation and recording.
+    legacy_arm_startup_travel_degrees: float = Field(
+        default=45.0,
+        validation_alias="arm_startup_travel_degrees",
+        gt=0.0,
+        le=45.0,
+        exclude=True,
+        repr=False,
+        deprecated="Compatibility-only; Stadia now uses calibrated endpoint bounds.",
+    )
+    legacy_gripper_startup_travel_percentage_points: float = Field(
+        default=45.0,
+        validation_alias="gripper_startup_travel_percentage_points",
+        gt=0.0,
+        le=45.0,
+        exclude=True,
+        repr=False,
+        deprecated="Compatibility-only; Stadia now uses calibrated endpoint bounds.",
+    )
 
     @field_validator(
         "deadzone",
         "max_step_per_tick",
-        "arm_startup_travel_degrees",
-        "gripper_startup_travel_percentage_points",
+        "legacy_arm_startup_travel_degrees",
+        "legacy_gripper_startup_travel_percentage_points",
         mode="before",
     )
     @classmethod

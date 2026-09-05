@@ -26,6 +26,7 @@ from lelab.stadia.session import (
     FollowerBuildSpec,
     StadiaSessionConfig,
     StadiaSessionWorker,
+    derive_calibrated_endpoint_bounds,
 )
 from lelab.stadia.thermal_safety import (
     ConfirmedTemperatureGuard,
@@ -62,11 +63,12 @@ def stadia_snapshot(
     connected: bool = True,
     rb: bool = False,
     left_x: float = 0.0,
+    triggers: tuple[float, float] = (-1.0, -1.0),
     guid: str = "stadia-guid",
     instance_id: int | None = 7,
     read_error: str | None = None,
 ) -> StadiaSnapshot:
-    axes = (left_x, 0.0, 0.0, 0.0, -1.0, -1.0) if connected else ()
+    axes = (left_x, 0.0, 0.0, 0.0, *triggers) if connected else ()
     buttons = [False] * 15 if connected else []
     if connected:
         buttons[10] = rb
@@ -522,7 +524,30 @@ def test_startup_waits_for_three_neutral_samples_then_arms_in_safe_order() -> No
     assert status.motion_state is MotionState.DISARMED
 
 
-def test_camera_setup_pose_drift_is_reread_for_anchor_and_goal_seed() -> None:
+def test_ble_zero_rest_requires_full_trigger_exercise_before_follower_access() -> None:
+    zero_rest = (0.0, 0.0)
+    full_press = (1.0, 1.0)
+    harness = make_harness(
+        startup=[
+            stadia_snapshot(1, triggers=zero_rest),
+            stadia_snapshot(2, triggers=zero_rest),
+            stadia_snapshot(3, triggers=zero_rest),
+            stadia_snapshot(4, triggers=full_press),
+            *(stadia_snapshot(sequence, triggers=zero_rest) for sequence in range(5, 11)),
+        ],
+        runtime=[stadia_snapshot(11, triggers=zero_rest)],
+    )
+
+    result = harness.worker.run()
+
+    assert result.terminal_state is ControlState.STOPPED
+    assert harness.events.index("follower.factory") > harness.events.index("reader.wait.9")
+    assert harness.events.index("camera.opal.connect") < harness.events.index("reader.wait.10")
+    assert result.commands_sent == 1
+    assert result.movement_steps == 0
+
+
+def test_camera_setup_pose_drift_is_reread_for_initial_target_and_goal_seed() -> None:
     harness = make_harness(runtime=[stadia_snapshot(5, rb=False)])
     camera = harness.follower.cameras["opal"]
     camera.connect_hook = lambda: harness.bus.pose.__setitem__("shoulder_pan", 2500)
@@ -689,8 +714,8 @@ def test_returned_clipping_is_counted_and_adopted_for_the_next_request() -> None
 
     assert result.relative_clipping_count == 1
     assert result.movement_steps == 2
-    assert harness.follower.sent_actions[0]["shoulder_pan.pos"] == pytest.approx(0.35)
-    assert harness.follower.sent_actions[1]["shoulder_pan.pos"] == pytest.approx(0.45)
+    assert harness.follower.sent_actions[0]["shoulder_pan.pos"] == pytest.approx(-0.35)
+    assert harness.follower.sent_actions[1]["shoulder_pan.pos"] == pytest.approx(-0.25)
 
 
 def test_live_speed_change_requires_rb_release_and_updates_exact_joint_caps() -> None:
@@ -708,7 +733,7 @@ def test_live_speed_change_requires_rb_release_and_updates_exact_joint_caps() ->
     result = harness.worker.run()
 
     assert result.movement_steps == 1
-    assert harness.follower.sent_actions[1]["shoulder_pan.pos"] == pytest.approx(0.7)
+    assert harness.follower.sent_actions[1]["shoulder_pan.pos"] == pytest.approx(-0.7)
     status = harness.manager.status_for("stadia-session", check_expiry=False)
     assert status is not None
     assert status.details["stadia_speed_multiplier"] == 2.0
@@ -732,7 +757,7 @@ def test_live_speed_change_is_rejected_while_rb_enables_motion() -> None:
 
     assert result.terminal_state is ControlState.STOPPED
     assert errors == ["release RB before changing Stadia speed"]
-    assert harness.follower.sent_actions[0]["shoulder_pan.pos"] == pytest.approx(0.35)
+    assert harness.follower.sent_actions[0]["shoulder_pan.pos"] == pytest.approx(-0.35)
 
 
 def test_authoritative_returned_actions_drive_the_urdf_broadcast() -> None:
@@ -807,7 +832,7 @@ def test_stale_and_reconnect_states_hold_then_require_fresh_neutral_release() ->
 
     assert result.movement_steps == 1
     assert [action["shoulder_pan.pos"] for action in harness.follower.sent_actions] == pytest.approx(
-        [0.0, 0.35]
+        [0.0, -0.35]
     )
 
 
@@ -1161,12 +1186,67 @@ def test_overrun_drops_missed_ticks_and_never_integrates_catch_up_steps() -> Non
     assert result.movement_steps == 2
     assert result.missed_ticks >= 5
     assert [action["shoulder_pan.pos"] for action in harness.follower.sent_actions] == pytest.approx(
-        [0.35, 0.7]
+        [-0.35, -0.7]
     )
 
 
+@pytest.mark.parametrize(
+    ("direction", "left_x", "triggers", "endpoint_index"),
+    [
+        (1.0, -1.0, (1.0, -1.0), 1),
+        (-1.0, 1.0, (-1.0, 1.0), 0),
+    ],
+)
+def test_session_travels_beyond_former_anchor_envelope_to_calibrated_endpoints(
+    direction: float,
+    left_x: float,
+    triggers: tuple[float, float],
+    endpoint_index: int,
+) -> None:
+    runtime = [
+        stadia_snapshot(sequence, rb=True, left_x=left_x, triggers=triggers) for sequence in range(5, 305)
+    ]
+    harness = make_harness(runtime=runtime)
+    harness.follower.stop_after_sends = len(runtime)
+    endpoint_bounds = derive_calibrated_endpoint_bounds(harness.follower)
+
+    result = harness.worker.run()
+
+    assert result.terminal_state is ControlState.STOPPED
+    assert len(harness.follower.sent_actions) == len(runtime)
+    sent = harness.follower.sent_actions
+    assert any(
+        direction * action["shoulder_pan.pos"] > 45.0 and direction * (action["gripper.pos"] - 50.0) > 45.0
+        for action in sent
+    )
+    assert sent[-1]["shoulder_pan.pos"] == endpoint_bounds["shoulder_pan.pos"][endpoint_index]
+    assert sent[-1]["gripper.pos"] == endpoint_bounds["gripper.pos"][endpoint_index]
+    for action in sent:
+        for key in ("shoulder_pan.pos", "gripper.pos"):
+            lower, upper = endpoint_bounds[key]
+            assert lower <= action[key] <= upper
+    for previous, current in zip(
+        [{"shoulder_pan.pos": 0.0, "gripper.pos": 50.0}, *sent[:-1]],
+        sent,
+        strict=True,
+    ):
+        assert abs(current["shoulder_pan.pos"] - previous["shoulder_pan.pos"]) <= 0.35 + 1e-12
+        assert abs(current["gripper.pos"] - previous["gripper.pos"]) <= 0.35 + 1e-12
+    assert dict(harness.build_specs[0].max_relative_target) == dict.fromkeys(
+        SO101_MOTOR_NAMES,
+        MAX_RELATIVE_TARGET,
+    )
+    assert result.saturation_count > 0
+    terminal = harness.manager.status_for("stadia-session", check_expiry=False)
+    assert terminal is not None
+    assert all(not hasattr(spec, "startup_min") for spec in terminal.joint_specs)
+    by_key = {spec.action_key: spec for spec in terminal.joint_specs}
+    assert by_key["shoulder_pan.pos"].calibrated_max == endpoint_bounds["shoulder_pan.pos"][1]
+    assert by_key["gripper.pos"].calibrated_min == endpoint_bounds["gripper.pos"][0]
+
+
 def test_session_surfaces_endpoint_saturation_in_typed_terminal_status() -> None:
-    harness = make_harness()
+    harness = make_harness(runtime=[stadia_snapshot(5, rb=True, left_x=-1.0)])
     harness.bus.pose["shoulder_pan"] = 3072
 
     result = harness.worker.run()

@@ -61,7 +61,6 @@ class JointControlSpec:
     action_key: str
     unit: PositionUnit
     max_step_per_tick: float = 0.35
-    startup_travel: float = 45.0
 
 
 DEFAULT_JOINT_SPECS = (
@@ -80,6 +79,10 @@ class TriggerNeutralState:
     exercised: bool = False
     released: bool = False
     requires_exercise: bool = False
+    signed_range_seen: bool = False
+    zero_baseline_learned: bool = False
+    zero_release_learned: bool = False
+    stable_zero_samples: int = 0
 
 
 @dataclass(frozen=True)

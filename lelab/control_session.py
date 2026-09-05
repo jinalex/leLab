@@ -86,8 +86,6 @@ class JointStatusSpec:
     unit: JointStatusUnit
     max_step_per_tick: float
     max_relative_target: float
-    startup_min: float
-    startup_max: float
     calibrated_min: float
     calibrated_max: float
 
@@ -107,8 +105,6 @@ class JointStatusSpec:
         numeric_fields = (
             "max_step_per_tick",
             "max_relative_target",
-            "startup_min",
-            "startup_max",
             "calibrated_min",
             "calibrated_max",
         )
@@ -119,8 +115,6 @@ class JointStatusSpec:
             object.__setattr__(self, field_name, float(value))
         if self.max_step_per_tick <= 0 or self.max_relative_target <= 0:
             raise ValueError("per-joint step and relative-target limits must be positive")
-        if self.startup_min > self.startup_max:
-            raise ValueError("startup bounds must be ordered")
         if self.calibrated_min > self.calibrated_max:
             raise ValueError("calibrated bounds must be ordered")
 
@@ -130,8 +124,6 @@ class JointStatusSpec:
             "unit": self.unit.value,
             "max_step_per_tick": self.max_step_per_tick,
             "max_relative_target": self.max_relative_target,
-            "startup_min": self.startup_min,
-            "startup_max": self.startup_max,
             "calibrated_min": self.calibrated_min,
             "calibrated_max": self.calibrated_max,
         }
@@ -554,8 +546,6 @@ class ControlStatus:
                 spec.action_key: {
                     "max_step_per_tick": spec.max_step_per_tick,
                     "max_relative_target": spec.max_relative_target,
-                    "startup_min": spec.startup_min,
-                    "startup_max": spec.startup_max,
                     "calibrated_min": spec.calibrated_min,
                     "calibrated_max": spec.calibrated_max,
                 }
