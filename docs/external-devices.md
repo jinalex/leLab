@@ -4,6 +4,11 @@ LeLab remains transport-agnostic. A serial adapter supplies a local port path;
 an installed LeRobot camera plugin supplies frames. SSH/Tailscale and device
 access policy belong to the bridge, not to LeLab. No new robot watchdog is added.
 
+For the SO-101 serial bridge, follow [guarded bridge setup](guarded-bridge.md).
+That release adds selected-port write checks and temporarily gates unvalidated
+bridge control modes; the generic camera/serial integration alone is not the
+complete command-integrity fix.
+
 ## Serial
 
 Use Calibration's existing manual port field for the adapter's stable PTY path.

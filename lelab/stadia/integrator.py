@@ -7,7 +7,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from numbers import Real
 
-from .action import compare_requested_returned, validate_returned_action
+from .action import ActionValidationError, compare_requested_returned, validate_returned_action
 from .types import (
     ACTION_KEYS,
     DEFAULT_JOINT_SPECS,
@@ -116,6 +116,10 @@ class BoundedStadiaIntegrator:
             validate_returned_action(returned_action),
             tolerance=tolerance,
         )
+        for key, value in comparison.returned.items():
+            lower, upper = self.endpoint_bounds[key]
+            if not lower <= value <= upper:
+                raise ActionValidationError(f"returned action {key}={value} outside calibrated endpoints")
         self.counters = IntegratorCounters(
             step_saturations=self.counters.step_saturations,
             travel_saturations=self.counters.travel_saturations,

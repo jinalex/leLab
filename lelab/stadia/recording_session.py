@@ -280,7 +280,11 @@ def _default_recording_follower_factory(spec: FollowerBuildSpec) -> object:
         use_degrees=spec.use_degrees,
         max_relative_target=dict(spec.max_relative_target),
     )
-    return SO101Follower(config)
+    from lelab.utils.follower_guard import install_guarded_followers, stadia_follower_construction
+
+    install_guarded_followers()
+    with stadia_follower_construction():
+        return SO101Follower(config)
 
 
 def _require_complete_local_resume(root: Path) -> None:
@@ -515,6 +519,9 @@ class _RecordingControl:
         after = integrator.counters
         saturations = _counter_delta(before, after)
         self._pending_motion = movement
+        self.worker._pending_command_snapshot = snapshot
+        with self.worker._speed_lock:
+            self.worker._movement_enabled = movement
         self.worker._publish_status(
             snapshot,
             MotionState.ENABLED if movement else MotionState.HOLD,

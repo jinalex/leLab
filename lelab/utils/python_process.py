@@ -6,6 +6,11 @@ import sys
 
 
 def python_module_command(module, arguments):
+    from .follower_guard import guarded_ports
+
+    if guarded_ports():
+        arguments = [module, "--", *arguments]
+        module = "lelab.scripts.guarded_module"
     raw = os.environ.get("LELAB_PYTHON_MODULE_WRAPPER")
     if raw is None:
         return [sys.executable, "-m", module, *arguments]
