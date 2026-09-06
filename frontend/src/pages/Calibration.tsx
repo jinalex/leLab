@@ -2136,6 +2136,11 @@ const Calibration = () => {
                   </p>
                 </div>
               )}
+              {!camerasActive && <CameraConfiguration
+                cameras={cameras}
+                onCamerasChange={handleCamerasChange}
+                browserEnabled={false}
+              />}
             </CardContent>
           </Card>
         )}

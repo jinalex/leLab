@@ -675,6 +675,7 @@ class ControlCoordinator:
         websocket_manager: object | None = None,
     ) -> ManagedWorker:
         from .stadia.session import StadiaSessionConfig, StadiaSessionWorker
+        from .utils.cameras import camera_projection
 
         record = resolved.record_model()
         broadcaster = (
@@ -693,10 +694,9 @@ class ControlCoordinator:
                 expected_guid=record.stadia.guid,
                 deadzone=record.stadia.deadzone,
                 max_step_per_tick=record.stadia.max_step_per_tick,
-                # Live teleoperation has never opened recording cameras.  Keep
-                # that legacy resource boundary; the Stadia recorder supplies
-                # its own lazily constructed camera configs.
-                cameras={},
+                # Browser cameras remain browser-owned. Installed plugin
+                # cameras belong to this worker and share its cleanup path.
+                cameras={c.name: camera_projection(c) for c in record.cameras if c.type != "opencv"},
             ),
             joint_broadcaster=broadcaster,
         )

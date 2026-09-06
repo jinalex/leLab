@@ -90,8 +90,8 @@ const InferenceModal: React.FC<Props> = ({
   const [policyConfigLoading, setPolicyConfigLoading] = useState(false);
   const [policyConfigError, setPolicyConfigError] = useState<string | null>(null);
 
-  // Per expected camera name → user-selected physical camera index (or null).
-  const [cameraBindings, setCameraBindings] = useState<Record<string, number | null>>({});
+  // Per expected camera name → user-selected saved camera ID (or null).
+  const [cameraBindings, setCameraBindings] = useState<Record<string, string | null>>({});
   const { cameras: availableCameras } = useAvailableCameras({ enabled: open });
 
   // Load checkpoints when modal opens.
@@ -134,7 +134,7 @@ const InferenceModal: React.FC<Props> = ({
         // Reset camera bindings to one entry per expected camera name.
         // Preserve any prior selection that's still relevant.
         setCameraBindings((prev) => {
-          const next: Record<string, number | null> = {};
+          const next: Record<string, string | null> = {};
           for (const name of Object.keys(cfg.image_features)) {
             next[name] = prev[name] ?? null;
           }
@@ -155,12 +155,12 @@ const InferenceModal: React.FC<Props> = ({
   }, [open, baseUrl, fetchWithHeaders, jobId, selectedStep]);
 
   // If the selected robot has an available saved camera whose name matches a
-  // policy feature, bind its saved index. Inference never substitutes an
+  // policy feature, bind its saved ID. Inference never substitutes an
   // arbitrary detected camera for the canonical robot configuration.
   useEffect(() => {
     if (!policyConfig) return;
     const robotCams = robot?.cameras ?? [];
-    if (robotCams.length === 0 || availableCameras.length === 0) return;
+    if (robotCams.length === 0) return;
     setCameraBindings((prev) => {
       let changed = false;
       const next = { ...prev };
@@ -178,8 +178,8 @@ const InferenceModal: React.FC<Props> = ({
               !camera.deviceId ||
               camera.deviceId === robotCam.device_id),
         );
-        if (live) {
-          next[policyName] = live.index;
+        if (live || robotCam.type !== "opencv") {
+          next[policyName] = robotCam.id;
           changed = true;
         }
       }
@@ -195,8 +195,7 @@ const InferenceModal: React.FC<Props> = ({
   const expectedCameraNames = policyConfig
     ? Object.keys(policyConfig.image_features)
     : [];
-  const savedCameraOptions = (robot?.cameras ?? []).flatMap((saved) => {
-    if (saved.camera_index == null) return [];
+  const savedCameraOptions = (robot?.cameras ?? []).map((saved) => {
     const live = availableCameras.find(
       (camera) =>
         camera.available &&
@@ -205,8 +204,8 @@ const InferenceModal: React.FC<Props> = ({
           !camera.deviceId ||
           camera.deviceId === saved.device_id),
     );
-    return live ? [{ saved, live }] : [];
-  });
+    return { saved, live: saved.type === "opencv" ? live : undefined };
+  }).filter(({ saved, live }) => saved.type !== "opencv" || live);
   const boundCameraIndexes = expectedCameraNames.map(
     (name) => cameraBindings[name],
   );
@@ -216,7 +215,7 @@ const InferenceModal: React.FC<Props> = ({
     const index = cameraBindings[name];
     const dims = policyConfig?.image_features[name];
     const option = savedCameraOptions.find(
-      ({ saved }) => saved.camera_index === index,
+      ({ saved }) => saved.id === index,
     );
     return Boolean(
       option &&
@@ -243,16 +242,16 @@ const InferenceModal: React.FC<Props> = ({
     setSubmitting(true);
     await new Promise((r) => setTimeout(r, 300));
     const cameraDict: Record<string, {
-      type: "opencv"; camera_index: number; width: number; height: number; fps?: number;
+      type: string; camera_id: string; width: number; height: number; fps?: number;
     }> = {};
     for (const name of Object.keys(policyConfig.image_features)) {
       const idx = cameraBindings[name];
       if (idx == null) continue;
-      const saved = robot.cameras.find((camera) => camera.camera_index === idx);
-      if (!saved || saved.camera_index == null) continue;
+      const saved = robot.cameras.find((camera) => camera.id === idx);
+      if (!saved) continue;
       cameraDict[name] = {
-        type: "opencv",
-        camera_index: saved.camera_index,
+        type: saved.type,
+        camera_id: saved.id,
         width: saved.width,
         height: saved.height,
         ...(saved.fps === undefined ? {} : { fps: saved.fps }),
@@ -285,8 +284,7 @@ const InferenceModal: React.FC<Props> = ({
   };
 
   const onCameraBindingChange = (name: string, value: string) => {
-    const idx = Number(value);
-    setCameraBindings((prev) => ({ ...prev, [name]: idx }));
+    setCameraBindings((prev) => ({ ...prev, [name]: value }));
   };
 
   return (
@@ -427,7 +425,7 @@ const InferenceModal: React.FC<Props> = ({
                   const dims = policyConfig.image_features[name];
                   const value = cameraBindings[name];
                   const option = savedCameraOptions.find(
-                    ({ saved }) => saved.camera_index === value,
+                    ({ saved }) => saved.id === value,
                   );
                   const bound = option?.live;
                   return (
@@ -456,9 +454,9 @@ const InferenceModal: React.FC<Props> = ({
                             savedCameraOptions.map(({ saved, live }) => (
                               <SelectItem
                                 key={saved.id}
-                                value={String(saved.camera_index)}
+                                value={saved.id}
                               >
-                                #{saved.camera_index} — {saved.name} ({live.name})
+                                {saved.name} ({live?.name ?? saved.type})
                               </SelectItem>
                             ))
                           )}

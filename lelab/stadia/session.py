@@ -28,8 +28,10 @@ from lelab.control_session import (
     MotionState,
     ThermalStatus,
     TorqueEvidence,
+    TorqueOutcome,
     classify_torque_outcome,
 )
+from lelab.utils.follower_guard import CommandCancelledError
 
 from .action import ActionValidationError, compare_requested_returned, validate_returned_action
 from .integrator import BoundedStadiaIntegrator
@@ -217,16 +219,22 @@ def _default_calibration_resolver(filename: str) -> str:
 def _default_follower_factory(spec: FollowerBuildSpec) -> object:
     # LeRobot remains absent from the import path until the controller gate has
     # proved a safe startup state.
+    from lelab.record import _platform_backend
+    from lelab.utils.cameras import build_camera_configs
     from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
     config = SO101FollowerConfig(
         port=spec.port,
         id=spec.calibration_id,
-        cameras=dict(spec.cameras),
+        cameras=build_camera_configs(spec.cameras, _platform_backend()),
         use_degrees=spec.use_degrees,
         max_relative_target=dict(spec.max_relative_target),
     )
-    return SO101Follower(config)
+    from lelab.utils.follower_guard import install_guarded_followers, stadia_follower_construction
+
+    install_guarded_followers()
+    with stadia_follower_construction():
+        return SO101Follower(config)
 
 
 def _default_thermal_guard(bus: object, sleeper: Callable[[float], None]) -> object:
@@ -490,6 +498,7 @@ class StadiaSessionWorker:
         self._speed_lock = threading.Lock()
         self._speed_multiplier = 1.0
         self._movement_enabled = False
+        self._pending_command_snapshot: StadiaSnapshot | None = None
         self._lifecycle_lock = threading.Lock()
         self._run_started = False
         self._thread: threading.Thread | None = None
@@ -670,6 +679,9 @@ class StadiaSessionWorker:
             # or camera work blocks. Require a distinct independent publication
             # after all of that work and before writing any goal or arming.
             prearm_snapshot = self._wait_for_prearm_confirmation(startup_snapshot)
+            write_guard = getattr(follower, "_lelab_follower_guard", None)
+            if write_guard is not None:
+                write_guard.before_write = lambda: self._require_prearm_snapshot_still_safe(prearm_snapshot)
             self._raise_if_stop_requested()
 
             # Read the initial target only after every potentially blocking setup step.
@@ -708,6 +720,8 @@ class StadiaSessionWorker:
             # is the actual arming operation in pinned LeRobot v0.6.0.
             self._configure_started = True
             follower.configure()
+            if write_guard is not None:
+                write_guard.before_write = self._require_current_write_authorization
             self._raise_if_stop_requested()
             self.manager.mark_running(self.claim.session_id)
             self._broadcast_joint_action(pose)
@@ -738,6 +752,7 @@ class StadiaSessionWorker:
                 stop_reason = (
                     f"{stop_reason}; manager stopping transition failed: {type(error).__name__}: {error}"
                 )
+            self._robot = None
             torque, teardown_errors = self._teardown(
                 bus=bus,
                 bus_connect_attempted=bus_connect_attempted,
@@ -924,6 +939,31 @@ class StadiaSessionWorker:
     def _prepare_dependencies(self, follower: object) -> None:
         """Prepare non-device resources before any follower device access."""
 
+    def _require_current_write_authorization(self) -> None:
+        """Sample reader truth immediately before a guarded bus goal write."""
+        try:
+            self._raise_if_stop_requested()
+        except _StopRequestedError as error:
+            # Let the outer owner handle the ordinary stop on its next tick;
+            # this unsent step must not turn a requested stop into a bus fault.
+            raise CommandCancelledError(str(error)) from error
+        snapshot = self.reader.snapshot()
+        decision, healthy, _age, reason = self._evaluate_snapshot(snapshot, now=self._now())
+        origin = self._pending_command_snapshot
+        if origin is None or not 0 <= self._now() - origin.sampled_at <= MAX_SNAPSHOT_AGE_S:
+            raise CommandCancelledError("command input expired during follower I/O")
+        if (origin.connection_generation, origin.instance_id) != (
+            snapshot.connection_generation,
+            snapshot.instance_id,
+        ):
+            raise CommandCancelledError("controller identity changed during follower I/O")
+        with self._speed_lock:
+            movement_requested = self._movement_enabled
+        if not healthy or not decision.profile_valid:
+            raise CommandCancelledError(reason or "controller is no longer fresh/connected")
+        if movement_requested and (not decision.motion_enabled or self.claim.hold_requested.is_set()):
+            raise CommandCancelledError("movement authorization changed during follower I/O")
+
     def _on_session_failure(self, error: Exception) -> None:
         """Allow specializations to publish a failure before terminal teardown."""
 
@@ -967,6 +1007,7 @@ class StadiaSessionWorker:
             tick = scheduler.poll(now, ready=healthy)
             self._missed_ticks += tick.missed_ticks
             if tick.should_step:
+                accepted_before = dict(self._integrator.target)
                 try:
                     mapped = map_stadia_input(
                         snapshot,
@@ -983,6 +1024,7 @@ class StadiaSessionWorker:
                     requested = integrated.action_dict()
                     if self._robot is None:
                         raise StadiaSessionRuntimeError("follower was not initialized")
+                    self._pending_command_snapshot = snapshot
                     returned_raw = self._robot.send_action(requested)
                     returned = validate_returned_action(returned_raw)
                     comparison = compare_requested_returned(requested, returned)
@@ -992,6 +1034,13 @@ class StadiaSessionWorker:
                             requested_action=comparison.requested,
                             tolerance=comparison.tolerance,
                         )
+                except CommandCancelledError:
+                    # Integration happened before the blocking follower read.
+                    # Nothing was written; do not retain its unsent step.
+                    with self._speed_lock:
+                        self._integrator.target = accepted_before
+                    self._publish_status(self.reader.snapshot(), MotionState.HOLD)
+                    continue
                 except ActionValidationError:
                     raise
                 except Exception as error:
@@ -1337,6 +1386,18 @@ class StadiaSessionWorker:
             disable_errors=disable_errors,
             verification_supported=verification_supported,
         )
+        write_guard = getattr(bus, "_lelab_follower_guard", None)
+        quarantined = False
+        if write_guard is not None:
+            try:
+                quarantined = bool(write_guard.protocol_status().get("quarantined"))
+            except Exception as error:
+                errors.append(f"bridge protocol status unavailable: {type(error).__name__}: {error}")
+                quarantined = True
+        if quarantined and readback is None:
+            # Keep the failed-attempt diagnostics, but do not turn unavailable
+            # physical torque evidence into an asserted motor state.
+            torque = replace(torque, outcome=TorqueOutcome.UNKNOWN)
 
         for name, camera in connected_cameras:
             camera_thread: object | None = None

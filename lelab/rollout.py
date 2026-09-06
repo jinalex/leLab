@@ -29,7 +29,6 @@ import logging
 import os
 import re
 import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -279,11 +278,9 @@ def _format_cameras_arg(cameras: dict[str, dict[str, Any]]) -> str:
     """Convert {name: {type, camera_index, width, height, fps}} into
     lerobot's CLI dict syntax. The frontend key `camera_index` is
     remapped to lerobot's `index_or_path`."""
-    remapped_cameras: dict[str, dict[str, Any]] = {}
-    for name, cfg in cameras.items():
-        remapped_cameras[name] = {
-            ("index_or_path" if k == "camera_index" else k): v for k, v in cfg.items() if v is not None
-        }
+    from .utils.cameras import camera_cli_config
+
+    remapped_cameras = {name: camera_cli_config(cfg) for name, cfg in cameras.items()}
     # JSON is valid YAML/Draccus input and, unlike hand-built mapping syntax,
     # safely quotes aliases and string scalars that contain punctuation.
     return json.dumps(remapped_cameras, separators=(",", ":"))
@@ -426,20 +423,22 @@ def handle_start_inference(request: InferenceRequest) -> dict[str, Any]:
         follower_id = setup_follower_calibration_file(request.follower_config)
         policy_path = _resolve_policy_path(request.policy_ref)
 
-        cmd = [
-            sys.executable,
-            "-m",
+        from .utils.python_process import python_module_command
+
+        cmd = python_module_command(
             "lerobot.scripts.lerobot_rollout",
-            "--strategy.type=base",
-            f"--policy.path={policy_path}",
-            f"--policy.device={_detect_device()}",
-            "--robot.type=so101_follower",
-            f"--robot.port={request.follower_port}",
-            f"--robot.id={follower_id}",
-            f"--task={request.task}",
-            f"--duration={request.duration_s}",
-            *_rollout_inference_args(policy_path),
-        ]
+            [
+                "--strategy.type=base",
+                f"--policy.path={policy_path}",
+                f"--policy.device={_detect_device()}",
+                "--robot.type=so101_follower",
+                f"--robot.port={request.follower_port}",
+                f"--robot.id={follower_id}",
+                f"--task={request.task}",
+                f"--duration={request.duration_s}",
+                *_rollout_inference_args(policy_path),
+            ],
+        )
         if request.cameras:
             cmd.append(f"--robot.cameras={_format_cameras_arg(request.cameras)}")
 

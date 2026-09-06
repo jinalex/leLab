@@ -41,6 +41,7 @@ export interface CameraConfig {
   id: string;
   name: string;
   type: string;
+  parameters?: Record<string, unknown>;
   camera_index?: number; // cv2 index — what the recorder opens
   device_id: string; // Browser deviceId matched to the cv2 index by AVFoundation localizedName
   width: number;
@@ -58,6 +59,7 @@ interface CameraConfigurationProps {
   // cameras as read-only live previews. Used in the recording dialog, where
   // cameras are managed on the Calibration page rather than added ad hoc.
   readOnly?: boolean;
+  browserEnabled?: boolean;
 }
 
 const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
@@ -65,6 +67,7 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
   onCamerasChange,
   releaseStreamsRef,
   readOnly = false,
+  browserEnabled = true,
 }) => {
   const { toast } = useToast();
 
@@ -72,9 +75,27 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
     cameras: availableCameras,
     isLoading: isLoadingCameras,
     refresh: refreshCameras,
-  } = useAvailableCameras();
+  } = useAvailableCameras({ enabled: browserEnabled });
   const [selectedCameraIndex, setSelectedCameraIndex] = useState<string>("");
   const [cameraName, setCameraName] = useState("");
+  const [pluginType, setPluginType] = useState("");
+  const [pluginParameters, setPluginParameters] = useState("{}");
+  const addPluginCamera = () => {
+    try {
+      const parameters = JSON.parse(pluginParameters);
+      if (!/^[a-z][a-z0-9_]*$/.test(pluginType) || pluginType === "opencv" ||
+          !parameters || Array.isArray(parameters) || typeof parameters !== "object" ||
+          ["type", "width", "height", "fps"].some(key => key in parameters) || !cameraName.trim()) {
+        throw new Error("Enter a backend type, camera name and JSON parameters without common camera fields.");
+      }
+      if (cameras.some(c => c.name === cameraName.trim())) throw new Error("Camera names must be unique.");
+      onCamerasChange([...cameras, {id: `camera_${Date.now()}`, name: cameraName.trim(),
+        type: pluginType, parameters, device_id: "", width: 640, height: 480, fps: 10}]);
+      setCameraName("");
+    } catch (error) {
+      toast({title: "Invalid plugin camera", description: String(error), variant: "destructive"});
+    }
+  };
 
   // cv2's AVFoundation order is uniqueID-sorted, so plugging/unplugging a
   // device between sessions shifts indices. The browser device_id stays
@@ -85,7 +106,7 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
     if (availableCameras.length === 0 || cameras.length === 0) return;
     let changed = false;
     const refreshed = cameras.map((cam) => {
-      if (!cam.device_id) return cam;
+      if (cam.type !== "opencv" || !cam.device_id) return cam;
       const match = availableCameras.find((m) => m.deviceId === cam.device_id);
       if (match && match.index !== cam.camera_index) {
         changed = true;
@@ -129,8 +150,8 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
     // device sneak in under a different index.
     const isDuplicate = cameras.some(
       (cam) =>
-        cam.camera_index === selectedCamera.index ||
-        (selectedCamera.deviceId && cam.device_id === selectedCamera.deviceId),
+        cam.type === "opencv" && (cam.camera_index === selectedCamera.index ||
+        (selectedCamera.deviceId && cam.device_id === selectedCamera.deviceId)),
     );
     if (isDuplicate) {
       toast({
@@ -202,7 +223,7 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
 
       {/* Add Camera Section — hidden in read-only mode (cameras are managed on
           the Calibration page, not added here). */}
-      {!readOnly && (
+      {!readOnly && browserEnabled && (
       <div className="bg-gray-800/50 rounded-lg p-4 space-y-4">
         <h4 className="text-md font-medium text-gray-300">Add Camera</h4>
 
@@ -243,8 +264,8 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
                 {availableCameras.map((camera) => {
                   const alreadyAdded = cameras.some(
                     (cam) =>
-                      cam.camera_index === camera.index ||
-                      (camera.deviceId && cam.device_id === camera.deviceId),
+                      cam.type === "opencv" && (cam.camera_index === camera.index ||
+                      (camera.deviceId && cam.device_id === camera.deviceId)),
                   );
                   return (
                     <SelectItem
@@ -307,7 +328,7 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
               <CameraPreview
                 key={camera.id}
                 camera={camera}
-                paused={streamsPaused}
+                paused={streamsPaused || !browserEnabled}
                 readOnly={readOnly}
                 onRemove={() => removeCamera(camera.id)}
                 onUpdate={(updates) => updateCamera(camera.id, updates)}
@@ -327,6 +348,18 @@ const CameraConfiguration: React.FC<CameraConfigurationProps> = ({
           </p>
         </div>
       )}
+      {!readOnly && <details className="rounded border border-gray-700 p-3 space-y-3">
+        <summary className="cursor-pointer text-gray-300">Add installed camera plugin (advanced)</summary>
+        <p className="text-xs text-gray-400">Install the LeRobot camera plugin in LeLab's Python environment first.
+          Network transport stays in that plugin. Preview appears during active teleoperation.</p>
+        <Input aria-label="Plugin camera name" placeholder="Camera name" value={cameraName}
+          onChange={e => setCameraName(e.target.value)} />
+        <Input aria-label="Camera backend type" placeholder="Registered backend type" value={pluginType}
+          onChange={e => setPluginType(e.target.value)} />
+        <textarea className="w-full rounded bg-gray-800 p-2 text-white font-mono" aria-label="Camera plugin parameters" value={pluginParameters}
+          onChange={e => setPluginParameters(e.target.value)} />
+        <Button type="button" onClick={addPluginCamera}>Add plugin camera</Button>
+      </details>}
     </div>
   );
 };
@@ -347,7 +380,7 @@ const CameraPreview: React.FC<CameraPreviewProps> = ({
   onUpdate,
 }) => {
   const { videoRef, hasError: streamError } = useCameraStream(
-    camera.device_id,
+    camera.type === "opencv" ? camera.device_id : "",
     paused
   );
   const showVideo = !paused && camera.device_id && !streamError;
@@ -366,7 +399,7 @@ const CameraPreview: React.FC<CameraPreviewProps> = ({
           <div className="w-full h-full flex flex-col items-center justify-center">
             <VideoOff className="w-8 h-8 text-gray-500 mb-2" />
             <span className="text-gray-500 text-sm">
-              {paused
+              {camera.type !== "opencv" ? `${camera.type}: preview during teleoperation` : paused
                 ? "Preview paused"
                 : camera.device_id
                 ? "Preview failed"
@@ -441,7 +474,7 @@ const CameraPreview: React.FC<CameraPreviewProps> = ({
                   max="60"
                 />
               </div>
-              <div className="flex items-center gap-2">
+              {camera.type === "opencv" && <div className="flex items-center gap-2">
                 <span className="w-16">FOURCC:</span>
                 <Select
                   value={camera.fourcc ?? FOURCC_AUTO}
@@ -470,8 +503,8 @@ const CameraPreview: React.FC<CameraPreviewProps> = ({
                     ))}
                   </SelectContent>
                 </Select>
-              </div>
-              <div className="flex items-center gap-2">
+              </div>}
+              {camera.type === "opencv" && <div className="flex items-center gap-2">
                 <span className="w-16">Backend:</span>
                 <Select
                   value={camera.backend ?? BACKEND_DEFAULT}
@@ -500,10 +533,10 @@ const CameraPreview: React.FC<CameraPreviewProps> = ({
                     ))}
                   </SelectContent>
                 </Select>
-              </div>
-              <p className="text-[10px] text-gray-500 leading-tight">
+              </div>}
+              {camera.type === "opencv" && <p className="text-[10px] text-gray-500 leading-tight">
                 Overriding the backend can reorder camera indices on macOS.
-              </p>
+              </p>}
             </div>
             <div className="text-xs text-gray-500">
               Type: {camera.type} | Device:{" "}

@@ -106,6 +106,7 @@ from .utils.config import (
     save_robot_port,
     save_robot_record_v2,
 )
+from .utils.follower_guard import install_guarded_followers
 from .utils.hf_auth import cached_whoami, handle_hf_auth_status, handle_hf_login, shared_hf_api
 from .utils.system import (
     handle_get_cuda_status,
@@ -120,6 +121,8 @@ from .utils.system import (
     handle_install_wandb_extra_status,
     warn_if_cuda_mismatch,
 )
+
+install_guarded_followers()
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -386,8 +389,9 @@ class InferenceCameraBinding(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    type: Literal["opencv"]
-    camera_index: int = Field(ge=0)
+    type: str = Field(pattern=r"^[a-z][a-z0-9_]*$")
+    camera_index: int | None = Field(default=None, ge=0)
+    camera_id: str | None = None
     width: int = Field(ge=1, le=8192)
     height: int = Field(ge=1, le=8192)
     fps: int | None = Field(default=None, ge=1, le=240)
@@ -818,7 +822,18 @@ def _resolve_inference_cameras(
             raise ValueError(
                 "inference camera aliases may contain only ASCII letters, digits, dot, dash, and underscore"
             )
-        matches = [camera for camera in record.cameras if camera.camera_index == binding.camera_index]
+        matches = [
+            camera
+            for camera in record.cameras
+            if (
+                camera.id == binding.camera_id
+                if binding.camera_id is not None
+                else camera.type == "opencv"
+                and binding.type == "opencv"
+                and binding.camera_index is not None
+                and camera.camera_index == binding.camera_index
+            )
+        ]
         if not matches:
             raise ValueError(
                 f"inference camera {alias!r} does not match a camera in saved robot {record.name!r}"
@@ -828,6 +843,8 @@ def _resolve_inference_cameras(
                 f"inference camera index {binding.camera_index} is ambiguous in saved robot {record.name!r}"
             )
         camera = matches[0]
+        if camera.type != binding.type:
+            raise ValueError("inference camera backend does not match saved camera")
         if camera.id in used_camera_ids:
             raise ValueError(f"saved camera {camera.id!r} cannot be bound to more than one policy alias")
         if (
@@ -856,6 +873,10 @@ def _resolve_inference_cameras(
             camera_config["fourcc"] = camera.fourcc
         if camera.backend is not None:
             camera_config["backend"] = camera.backend
+        if camera.type != "opencv":
+            from .utils.cameras import camera_projection
+
+            camera_config = camera_projection(camera)
         resolved[alias] = camera_config
     return resolved
 
@@ -1313,6 +1334,40 @@ def recording_status():
         )
         result["available_controls"]["stop_recording"] = active
     return result
+
+
+@app.get("/teleop-camera-frame/{cam_key}")
+def teleop_camera_frame(cam_key: str, session_id: str):
+    """Read an already-owned camera; this route never opens hardware."""
+    operations = {ControlOperation.LEADER_TELEOPERATION, ControlOperation.STADIA_TELEOPERATION}
+    status = _matching_control_status(operations)
+    if status is None or status.session_id != session_id or status.state is not ControlState.RUNNING:
+        raise HTTPException(status_code=409, detail="No matching running teleoperation session")
+    if status.operation is ControlOperation.STADIA_TELEOPERATION:
+        worker = _control().active_managed_worker(session_id, operation=status.operation)
+        robot = getattr(worker, "_robot", None)
+    else:
+        from . import teleoperate
+
+        robot = teleoperate.current_robot
+    camera = getattr(robot, "cameras", {}).get(cam_key)
+    if camera is None:
+        raise HTTPException(status_code=404, detail="Camera is not owned by this session")
+    try:
+        import cv2
+
+        frame = camera.read_latest()
+        if getattr(getattr(camera, "config", None), "color_mode", "rgb") == "rgb":
+            frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        ok, encoded = cv2.imencode(".jpg", frame)
+        if not ok:
+            raise ValueError("JPEG encoding failed")
+    except Exception as error:
+        raise HTTPException(status_code=503, detail="Camera frame unavailable") from error
+    current = _matching_control_status(operations)
+    if current is None or current.session_id != session_id or current.state is not ControlState.RUNNING:
+        raise HTTPException(status_code=409, detail="Teleoperation session ended")
+    return Response(encoded.tobytes(), media_type="image/jpeg", headers={"Cache-Control": "no-store"})
 
 
 @app.get("/camera-feed/{cam_key}")

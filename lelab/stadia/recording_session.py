@@ -60,7 +60,7 @@ from .session import (
 from .types import ACTION_KEYS, IntegratorCounters
 
 _REPO_COMPONENT = re.compile(r"^[A-Za-z0-9._-]+$")
-_CAMERA_FIELDS = ("type", "camera_index", "width", "height", "fps", "fourcc", "backend")
+_CAMERA_FIELDS = ("type", "camera_index", "width", "height", "fps", "fourcc", "backend", "parameters")
 
 
 class RecordingDatasetAdapter(Protocol):
@@ -232,6 +232,8 @@ def resolve_recording_repo_id(
 
 
 def _canonical_camera_projection(record_cameras: object) -> dict[str, dict[str, object]]:
+    from lelab.utils.cameras import camera_projection
+
     if not isinstance(record_cameras, (list, tuple)):
         raise ValueError("saved robot cameras must be a list")
     projected: dict[str, dict[str, object]] = {}
@@ -239,18 +241,7 @@ def _canonical_camera_projection(record_cameras: object) -> dict[str, dict[str, 
         name = getattr(camera, "name", None)
         if not isinstance(name, str) or not name or name in projected:
             raise ValueError("saved robot camera names must be unique non-empty strings")
-        values = {
-            "type": getattr(camera, "type", None),
-            "camera_index": getattr(camera, "camera_index", None),
-            "width": getattr(camera, "width", None),
-            "height": getattr(camera, "height", None),
-            "fps": getattr(camera, "fps", None),
-        }
-        for optional in ("fourcc", "backend"):
-            value = getattr(camera, optional, None)
-            if value is not None:
-                values[optional] = value
-        projected[name] = values
+        projected[name] = camera_projection(camera)
     return projected
 
 
@@ -269,10 +260,10 @@ def _request_camera_projection(value: object) -> dict[str, dict[str, object]]:
 
 
 def _default_recording_follower_factory(spec: FollowerBuildSpec) -> object:
-    """Construct only the follower and its saved OpenCV cameras, lazily."""
+    """Construct only the follower and its saved cameras, lazily."""
 
+    from lelab.utils.cameras import build_camera_configs
     from lerobot.cameras.configs import Cv2Backends
-    from lerobot.cameras.opencv import OpenCVCameraConfig
     from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
     default_backends = {
@@ -281,20 +272,7 @@ def _default_recording_follower_factory(spec: FollowerBuildSpec) -> object:
         "Windows": Cv2Backends.DSHOW,
     }
     default_backend = default_backends.get(platform.system(), Cv2Backends.ANY)
-    camera_configs: dict[str, object] = {}
-    for name, raw in spec.cameras.items():
-        if not isinstance(raw, Mapping) or raw.get("type") != "opencv":
-            raise ValueError(f"unsupported saved camera configuration for {name!r}")
-        backend_name = raw.get("backend")
-        backend = Cv2Backends[str(backend_name)] if backend_name else default_backend
-        camera_configs[name] = OpenCVCameraConfig(
-            index_or_path=raw["camera_index"],
-            backend=backend,
-            fps=raw["fps"],
-            width=raw["width"],
-            height=raw["height"],
-            fourcc=raw.get("fourcc") or None,
-        )
+    camera_configs = build_camera_configs(spec.cameras, default_backend)
     config = SO101FollowerConfig(
         port=spec.port,
         id=spec.calibration_id,
@@ -302,7 +280,11 @@ def _default_recording_follower_factory(spec: FollowerBuildSpec) -> object:
         use_degrees=spec.use_degrees,
         max_relative_target=dict(spec.max_relative_target),
     )
-    return SO101Follower(config)
+    from lelab.utils.follower_guard import install_guarded_followers, stadia_follower_construction
+
+    install_guarded_followers()
+    with stadia_follower_construction():
+        return SO101Follower(config)
 
 
 def _require_complete_local_resume(root: Path) -> None:
@@ -537,6 +519,9 @@ class _RecordingControl:
         after = integrator.counters
         saturations = _counter_delta(before, after)
         self._pending_motion = movement
+        self.worker._pending_command_snapshot = snapshot
+        with self.worker._speed_lock:
+            self.worker._movement_enabled = movement
         self.worker._publish_status(
             snapshot,
             MotionState.ENABLED if movement else MotionState.HOLD,

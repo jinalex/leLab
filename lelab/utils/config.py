@@ -397,13 +397,14 @@ class DeviceRecord(BaseModel):
 
 
 class CameraRecord(BaseModel):
-    """The OpenCV camera fields already persisted by LeLab's frontend."""
+    """Saved local camera fields or an installed LeRobot camera plugin config."""
 
     model_config = ConfigDict(extra="forbid")
 
     id: str
     name: str
-    type: Literal["opencv"] = "opencv"
+    type: str = Field(default="opencv", pattern=r"^[a-z][a-z0-9_]*$")
+    parameters: dict[str, Any] = Field(default_factory=dict)
     # The existing recorder has always defaulted a missing legacy index to 0.
     # Keep that normalization behavior while still persisting a concrete V2
     # value on the next explicit save.
@@ -438,6 +439,14 @@ class CameraRecord(BaseModel):
     def _validate_device_id(cls, value: str) -> str:
         if "\x00" in value:
             raise ValueError("camera device_id cannot contain a NUL byte")
+        return value
+
+    @field_validator("parameters")
+    @classmethod
+    def _validate_parameters(cls, value):
+        if set(value) & {"type", "width", "height", "fps"}:
+            raise ValueError("camera parameters cannot override common camera fields")
+        json.dumps(value, allow_nan=False)
         return value
 
 
@@ -664,7 +673,12 @@ def _legacy_record_projection(record: RobotRecordV2) -> dict[str, Any]:
         "follower_port": record.follower.port,
         "leader_config": leader.calibration,
         "follower_config": record.follower.calibration,
-        "cameras": [camera.model_dump(mode="json", exclude_none=True) for camera in record.cameras],
+        "cameras": [
+            camera.model_dump(
+                mode="json", exclude_none=True, exclude={"parameters"} if camera.type == "opencv" else set()
+            )
+            for camera in record.cameras
+        ],
     }
 
 

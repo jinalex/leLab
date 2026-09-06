@@ -61,6 +61,7 @@ interface RecordingConfig {
   cameras: Record<string, {
     type: string;
     camera_index?: number;
+    parameters?: Record<string, unknown>;
     width: number;
     height: number;
     fps?: number | null;
@@ -213,8 +214,10 @@ const parseRecordingNavigationState = (
         "fps",
         "fourcc",
         "backend",
+        "parameters",
       ]) ||
-      camera.type !== "opencv" ||
+      (typeof camera.type !== "string" || !/^[a-z][a-z0-9_]*$/.test(camera.type)) ||
+      (camera.parameters !== undefined && !isObject(camera.parameters)) ||
       !Number.isInteger(camera.width) ||
       (camera.width as number) < 1 ||
       !Number.isInteger(camera.height) ||
@@ -233,6 +236,7 @@ const parseRecordingNavigationState = (
     }
     if (
       value.operation === "stadia_recording" &&
+      camera.type === "opencv" &&
       (!Object.prototype.hasOwnProperty.call(camera, "camera_index") ||
         !Number.isInteger(camera.camera_index) ||
         !Object.prototype.hasOwnProperty.call(camera, "fps") ||

@@ -118,36 +118,9 @@ def _build_camera_configs(cameras: dict, default_backend) -> dict:
     `backend` (a Cv2Backends name) and `fourcc` (a 4-char code) are optional per
     camera; when omitted they fall back to `default_backend` and auto-detect.
     """
-    from lerobot.cameras.configs import Cv2Backends
-    from lerobot.cameras.opencv import OpenCVCameraConfig
+    from .utils.cameras import build_camera_configs
 
-    camera_configs: dict = {}
-    for camera_name, camera_data in cameras.items():
-        if camera_data.get("type") != "opencv":
-            logger.warning(
-                f"⚠️ CAMERA CONFIG: Unsupported camera type '{camera_data.get('type')}' for {camera_name}"
-            )
-            continue
-
-        backend_name = camera_data.get("backend")
-        backend = Cv2Backends[backend_name] if backend_name else default_backend
-        fourcc = camera_data.get("fourcc") or None
-
-        camera_configs[camera_name] = OpenCVCameraConfig(
-            index_or_path=camera_data.get("camera_index", 0),
-            backend=backend,
-            fps=camera_data.get("fps"),
-            width=camera_data.get("width"),
-            height=camera_data.get("height"),
-            fourcc=fourcc,
-        )
-        logger.info(
-            f"✅ CAMERA CONFIG: {camera_name} -> OpenCVCameraConfig("
-            f"index={camera_data.get('camera_index')}, backend={backend.name}, "
-            f"{camera_data.get('width')}x{camera_data.get('height')}@{camera_data.get('fps')}fps, "
-            f"fourcc={fourcc})"
-        )
-    return camera_configs
+    return build_camera_configs(cameras, default_backend)
 
 
 def create_record_config(request: RecordingRequest) -> RecordConfig:

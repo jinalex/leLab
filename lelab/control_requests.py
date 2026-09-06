@@ -190,6 +190,16 @@ class ResolvedControlRequest:
                 "follower_config": self.canonical_record["follower"]["calibration"],
             }
         )
+        if "teleoperation" in self.operation.value:
+            from .utils.cameras import camera_projection
+
+            cameras = {
+                camera.name: camera_projection(camera)
+                for camera in self.record_model().cameras
+                if camera.type != "opencv"
+            }
+            if cameras:
+                payload["cameras"] = cameras
         return payload
 
 
