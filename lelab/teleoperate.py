@@ -18,7 +18,7 @@ import threading
 import time
 from typing import Any
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 from lerobot.teleoperators.so_leader import SO101Leader, SO101LeaderConfig
@@ -45,6 +45,7 @@ class TeleoperateRequest(BaseModel):
     follower_port: str
     leader_config: str
     follower_config: str
+    cameras: dict = Field(default_factory=dict)
 
 
 def get_joint_positions_from_robot(robot) -> dict[str, float]:
@@ -176,6 +177,11 @@ def handle_start_teleoperation(request: TeleoperateRequest, websocket_manager=No
         robot_config = SO101FollowerConfig(
             port=request.follower_port,
             id=follower_config_name,
+            **(
+                {"cameras": _record._build_camera_configs(request.cameras, _record._platform_backend())}
+                if request.cameras
+                else {}
+            ),
         )
 
         teleop_config = SO101LeaderConfig(

@@ -200,7 +200,9 @@ const Landing = () => {
       (acc, cam) => {
         acc[cam.name] = {
           type: cam.type,
-          camera_index: cam.camera_index,
+          ...(cam.type === "opencv"
+            ? { camera_index: cam.camera_index }
+            : { parameters: cam.parameters ?? {} }),
           width: cam.width,
           height: cam.height,
           // The Stadia worker compares this projection exactly with the
@@ -220,6 +222,7 @@ const Landing = () => {
         {
           type: string;
           camera_index?: number;
+          parameters?: Record<string, unknown>;
           width: number;
           height: number;
           fps?: number | null;

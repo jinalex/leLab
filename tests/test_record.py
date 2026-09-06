@@ -130,14 +130,13 @@ def test_build_camera_configs_invalid_backend_raises() -> None:
         _build_camera_configs(cameras, Cv2Backends.ANY)
 
 
-def test_build_camera_configs_skips_non_opencv_type() -> None:
+def test_build_camera_configs_rejects_malformed_plugin_instead_of_silently_skipping() -> None:
     from lelab.record import _build_camera_configs
     from lerobot.cameras.configs import Cv2Backends
 
     cameras = {"cam": {"type": "realsense", "camera_index": 0}}
-    configs = _build_camera_configs(cameras, Cv2Backends.ANY)
-
-    assert configs == {}
+    with pytest.raises(ValueError, match="unexpected plugin camera fields"):
+        _build_camera_configs(cameras, Cv2Backends.ANY)
 
 
 def test_recording_worker_failure_is_retained_across_status_polls(

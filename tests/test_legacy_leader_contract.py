@@ -37,7 +37,9 @@ def test_current_browser_request_shapes_and_recording_defaults_are_accepted() ->
         "leader_config": "leader-alpha",
         "follower_config": "follower-alpha",
     }
-    assert TeleoperateRequest.model_validate(teleoperate_payload).model_dump() == teleoperate_payload
+    parsed = TeleoperateRequest.model_validate(teleoperate_payload)
+    assert parsed.model_dump(exclude_unset=True) == teleoperate_payload
+    assert parsed.cameras == {}
 
     recording_payload = {
         "leader_port": "/dev/leader",

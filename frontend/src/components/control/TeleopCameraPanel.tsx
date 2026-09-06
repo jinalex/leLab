@@ -5,6 +5,8 @@ import { Label } from "@/components/ui/label";
 import { Switch } from "@/components/ui/switch";
 import { useRobots } from "@/hooks/useRobots";
 import CameraFeed from "./CameraFeed";
+import BackendCameraFeed from "./BackendCameraFeed";
+import { useLocation } from "react-router-dom";
 
 /**
  * Optional live camera panel for the teleoperation page. Off by default so we
@@ -19,6 +21,8 @@ import CameraFeed from "./CameraFeed";
  */
 const TeleopCameraPanel: React.FC = () => {
   const [enabled, setEnabled] = useState(false);
+  const { state } = useLocation();
+  const sessionId = typeof state?.session_id === "string" ? state.session_id : "";
   // Bumped by the retry button to remount the feeds (a fresh getUserMedia
   // attempt) — useful if a camera was unplugged and reconnected.
   const [reloadKey, setReloadKey] = useState(0);
@@ -33,6 +37,7 @@ const TeleopCameraPanel: React.FC = () => {
     key: c.id,
     name: c.name,
     deviceId: c.device_id,
+    type: c.type,
   }));
 
   return (
@@ -68,7 +73,11 @@ const TeleopCameraPanel: React.FC = () => {
         feeds.length > 0 ? (
           <div className="flex flex-col gap-3 overflow-y-auto">
             {feeds.map((feed) => (
-              <CameraFeed
+              feed.type !== "opencv" ? <BackendCameraFeed
+                key={`${feed.key}:${reloadKey}`}
+                name={feed.name}
+                sessionId={sessionId}
+              /> : <CameraFeed
                 key={`${feed.key}:${reloadKey}`}
                 deviceId={feed.deviceId}
                 label={feed.name}

@@ -28,7 +28,8 @@ export interface StadiaConfig {
 export interface RobotCameraRecord {
   id: string;
   name: string;
-  type: "opencv";
+  type: string;
+  parameters?: Record<string, unknown>;
   camera_index?: number;
   device_id: string;
   width: number;
@@ -333,14 +334,15 @@ const parseStadia = (value: unknown): StadiaConfig | null => {
 
 const parseCamera = (value: unknown): RobotCameraRecord | null => {
   const required = ["id", "name", "type", "device_id", "width", "height"];
-  const optional = ["camera_index", "fps", "fourcc", "backend"];
+  const optional = ["camera_index", "fps", "fourcc", "backend", "parameters"];
   if (!isObject(value) || !exactKeys(value, required, optional)) return null;
   if (
     !nonEmptyString(value.id) ||
     value.id.trim() !== value.id ||
     !nonEmptyString(value.name) ||
     value.name.trim() !== value.name ||
-    value.type !== "opencv" ||
+    typeof value.type !== "string" || !/^[a-z][a-z0-9_]*$/.test(value.type) ||
+    !(value.parameters === undefined || (isObject(value.parameters) && jsonSafe(value.parameters))) ||
     typeof value.device_id !== "string" ||
     value.device_id.includes("\0") ||
     !nonnegativeInteger(value.camera_index ?? 0) ||
@@ -362,7 +364,8 @@ const parseCamera = (value: unknown): RobotCameraRecord | null => {
   return {
     id: value.id,
     name: value.name,
-    type: "opencv",
+    type: value.type,
+    parameters: value.parameters as Record<string, unknown> | undefined,
     camera_index: value.camera_index as number | undefined,
     device_id: value.device_id,
     width: value.width,

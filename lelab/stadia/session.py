@@ -217,12 +217,14 @@ def _default_calibration_resolver(filename: str) -> str:
 def _default_follower_factory(spec: FollowerBuildSpec) -> object:
     # LeRobot remains absent from the import path until the controller gate has
     # proved a safe startup state.
+    from lelab.record import _platform_backend
+    from lelab.utils.cameras import build_camera_configs
     from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
 
     config = SO101FollowerConfig(
         port=spec.port,
         id=spec.calibration_id,
-        cameras=dict(spec.cameras),
+        cameras=build_camera_configs(spec.cameras, _platform_backend()),
         use_degrees=spec.use_degrees,
         max_relative_target=dict(spec.max_relative_target),
     )
@@ -738,6 +740,7 @@ class StadiaSessionWorker:
                 stop_reason = (
                     f"{stop_reason}; manager stopping transition failed: {type(error).__name__}: {error}"
                 )
+            self._robot = None
             torque, teardown_errors = self._teardown(
                 bus=bus,
                 bus_connect_attempted=bus_connect_attempted,

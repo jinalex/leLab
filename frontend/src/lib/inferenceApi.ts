@@ -10,8 +10,9 @@ export interface StartInferenceRequest {
   policy_ref: string;
   task: string;
   cameras: Record<string, {
-    type: "opencv";
-    camera_index: number;
+    type: string;
+    camera_id?: string;
+    camera_index?: number;
     width: number;
     height: number;
     fps?: number;
