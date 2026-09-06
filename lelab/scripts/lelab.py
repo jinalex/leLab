@@ -476,7 +476,9 @@ def main(argv: Sequence[str] | None = None) -> None:
 
     if args.dev and args.rebuild:
         parser.error("--rebuild is for production mode; dev mode serves from Vite.")
-    if args.dev and os.environ.get("LELAB_PYTHON_MODULE_WRAPPER"):
+    if args.dev and (
+        os.environ.get("LELAB_PYTHON_MODULE_WRAPPER") or os.environ.get("LELAB_GUARDED_FOLLOWER_PORTS")
+    ):
         parser.error("External Python wrappers require production mode (no --dev reload worker).")
 
     if args.dev:

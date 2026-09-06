@@ -106,6 +106,7 @@ from .utils.config import (
     save_robot_port,
     save_robot_record_v2,
 )
+from .utils.follower_guard import install_guarded_followers
 from .utils.hf_auth import cached_whoami, handle_hf_auth_status, handle_hf_login, shared_hf_api
 from .utils.system import (
     handle_get_cuda_status,
@@ -120,6 +121,8 @@ from .utils.system import (
     handle_install_wandb_extra_status,
     warn_if_cuda_mismatch,
 )
+
+install_guarded_followers()
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
