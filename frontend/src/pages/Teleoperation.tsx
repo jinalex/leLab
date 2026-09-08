@@ -225,7 +225,7 @@ const TeleoperationPage = () => {
                 <div className="rounded-lg border border-slate-700 bg-slate-900/80 p-4 text-white">
                   <div className="flex items-center justify-between gap-3">
                     <div>
-                      <div className="text-sm font-medium text-slate-100">Stadia speed</div>
+                      <div className="text-sm font-medium text-slate-100">Session speed</div>
                       <div className="text-xs text-slate-400">
                         Release RB before changing speed.
                       </div>

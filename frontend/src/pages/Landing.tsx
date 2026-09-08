@@ -35,6 +35,7 @@ const Landing = () => {
     selectRobot,
     createRobot,
     deleteRobot,
+    updateStadiaSpeed,
   } = useRobots();
 
   const { datasets, loading: datasetsLoading } = useDatasets();
@@ -278,6 +279,7 @@ const Landing = () => {
             selectRobot={selectRobot}
             createRobot={createRobot}
             deleteRobot={deleteRobot}
+            updateStadiaSpeed={updateStadiaSpeed}
           />
           <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
             <div className="bg-gray-800 rounded-lg border border-gray-700 p-3 flex flex-col gap-2">

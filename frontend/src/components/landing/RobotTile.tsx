@@ -22,6 +22,13 @@ import {
 } from "@/lib/robotConfig";
 import RobotSelector from "./RobotSelector";
 import StadiaStartupInstructions from "@/components/control/StadiaStartupInstructions";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
 
 interface RobotTileProps {
   robot: RobotRecord | null;
@@ -34,6 +41,7 @@ interface RobotTileProps {
   onConfigure: (name: string) => void;
   onTeleop: (robot: RobotRecord) => void;
   onDelete: (name: string) => void;
+  onStadiaSpeedChange: (name: string, speedMultiplier: number) => Promise<boolean>;
 }
 
 const RobotTile: React.FC<RobotTileProps> = ({
@@ -47,9 +55,11 @@ const RobotTile: React.FC<RobotTileProps> = ({
   onConfigure,
   onTeleop,
   onDelete,
+  onStadiaSpeedChange,
 }) => {
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmStadiaTeleop, setConfirmStadiaTeleop] = useState(false);
+  const [speedPending, setSpeedPending] = useState(false);
   const teleopReadiness = robot
     ? readinessFor(robot, teleoperationOperation(robot))
     : null;
@@ -64,6 +74,11 @@ const RobotTile: React.FC<RobotTileProps> = ({
   const unavailableReason = teleopReadiness?.issues
     .map((issue) => issue.message)
     .join(" ");
+  const globalSpeedOptions = Array.from(
+    new Set([0.5, 1, 2, 3, 4, 5, robot?.stadia.speed_multiplier]),
+  )
+    .filter((speed): speed is number => typeof speed === "number")
+    .sort((left, right) => left - right);
 
   return (
     <div className="bg-gray-800 rounded-lg border border-gray-700 p-3 flex flex-col gap-2 relative">
@@ -139,7 +154,7 @@ const RobotTile: React.FC<RobotTileProps> = ({
                   }
                   onTeleop(robot);
                 }}
-                disabled={teleopDisabled}
+                disabled={teleopDisabled || speedPending}
                 className={`w-full ${
                   teleopDisabled
                     ? "bg-red-500/30 hover:bg-red-500/30 text-red-200 cursor-not-allowed"
@@ -156,6 +171,38 @@ const RobotTile: React.FC<RobotTileProps> = ({
             </TooltipContent>
           )}
         </Tooltip>
+      )}
+
+      {robot?.teleoperator_type === "stadia" && (
+        <div className="flex items-center justify-between gap-3 rounded-md border border-purple-800/60 bg-purple-950/30 px-3 py-2">
+          <div>
+            <div className="text-xs font-medium text-purple-100">Global Stadia speed</div>
+            <div className="text-[11px] text-purple-300">Teleoperation + recording · next session</div>
+          </div>
+          <Select
+            value={String(robot.stadia.speed_multiplier)}
+            disabled={speedPending}
+            onValueChange={async (value) => {
+              setSpeedPending(true);
+              await onStadiaSpeedChange(robot.name, Number(value));
+              setSpeedPending(false);
+            }}
+          >
+            <SelectTrigger
+              aria-label="Global Stadia speed"
+              className="h-8 w-24 border-purple-700 bg-slate-900 text-purple-100"
+            >
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {globalSpeedOptions.map((speed) => (
+                <SelectItem key={speed} value={String(speed)}>
+                  {speed}×
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </div>
       )}
 
       {robot?.teleoperator_type === "stadia" && (

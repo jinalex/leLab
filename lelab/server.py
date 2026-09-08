@@ -375,7 +375,7 @@ class ControlSessionBody(BaseModel):
 class StadiaSpeedBody(ControlSessionBody):
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    multiplier: float = Field(ge=0.25, le=2.0)
+    multiplier: float = Field(ge=0.25, le=5.0)
 
 
 class ControllerCheckBody(BaseModel):

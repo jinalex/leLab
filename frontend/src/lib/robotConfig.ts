@@ -23,6 +23,7 @@ export interface StadiaConfig {
   guid: string | null;
   deadzone: number;
   max_step_per_tick: number;
+  speed_multiplier: number;
 }
 
 export interface RobotCameraRecord {
@@ -296,7 +297,7 @@ const parseDevice = (value: unknown): RobotDeviceRecord | null => {
 };
 
 const parseStadia = (value: unknown): StadiaConfig | null => {
-  const required = ["guid", "deadzone", "max_step_per_tick"];
+  const required = ["guid", "deadzone", "max_step_per_tick", "speed_multiplier"];
   const legacyTravelKeys = [
     "arm_startup_travel_degrees",
     "gripper_startup_travel_percentage_points",
@@ -317,6 +318,9 @@ const parseStadia = (value: unknown): StadiaConfig | null => {
     !finiteNumber(value.max_step_per_tick) ||
     value.max_step_per_tick <= 0 ||
     value.max_step_per_tick > 0.35 ||
+    !finiteNumber(value.speed_multiplier) ||
+    value.speed_multiplier < 0.25 ||
+    value.speed_multiplier > 5 ||
     legacyTravelKeys.some(
       (key) =>
         Object.prototype.hasOwnProperty.call(value, key) &&
@@ -329,6 +333,7 @@ const parseStadia = (value: unknown): StadiaConfig | null => {
     guid,
     deadzone: value.deadzone,
     max_step_per_tick: value.max_step_per_tick,
+    speed_multiplier: value.speed_multiplier,
   };
 };
 

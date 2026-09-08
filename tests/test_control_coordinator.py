@@ -912,7 +912,7 @@ def test_default_stadia_teleoperation_receives_the_websocket_broadcaster(
     manager = ControlSessionManager(lease_ttl_s=10.0, lease_renew_interval_s=1.0)
     coordinator = ControlCoordinator(manager, monitor_interval_s=0.002)
     socket_manager = SimpleNamespace(broadcast_joint_data_sync=lambda _payload: None)
-    record = SimpleNamespace(stadia=SimpleNamespace(max_step_per_tick=0.35))
+    record = SimpleNamespace(stadia=SimpleNamespace(max_step_per_tick=0.35, speed_multiplier=4.0))
     resolved = SimpleNamespace(
         teleoperator_type="stadia",
         robot_name="saved-arm",
@@ -937,8 +937,8 @@ def test_default_stadia_teleoperation_receives_the_websocket_broadcaster(
 
     assert result["success"] is True
     assert received == [socket_manager]
-    assert result["status"]["details"]["stadia_speed_multiplier"] == 2.0
-    assert result["status"]["details"]["stadia_effective_max_step_per_tick"] == 0.7
+    assert result["status"]["details"]["stadia_speed_multiplier"] == 4.0
+    assert result["status"]["details"]["stadia_effective_max_step_per_tick"] == 1.4
     coordinator.request_stop(str(result["session_id"]))
     wait_for_terminal(manager, str(result["session_id"]))
 

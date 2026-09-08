@@ -179,6 +179,7 @@ def test_legacy_stadia_travel_fields_load_without_writing_and_strip_on_save(
         "guid": "stadia-guid",
         "deadzone": 0.15,
         "max_step_per_tick": 0.35,
+        "speed_multiplier": 2.0,
     }
     assert path.read_text() == original
 
@@ -194,6 +195,7 @@ def test_legacy_stadia_travel_fields_load_without_writing_and_strip_on_save(
         "guid": "stadia-guid",
         "deadzone": 0.2,
         "max_step_per_tick": 0.35,
+        "speed_multiplier": 2.0,
     }
 
 
@@ -224,6 +226,8 @@ def test_stadia_numeric_settings_reject_coerced_non_numbers(value: object) -> No
         ("deadzone", 1.0),
         ("max_step_per_tick", 0.0),
         ("max_step_per_tick", 0.36),
+        ("speed_multiplier", 0.24),
+        ("speed_multiplier", 5.01),
         ("arm_startup_travel_degrees", 45.01),
         ("gripper_startup_travel_percentage_points", 45.01),
     ],

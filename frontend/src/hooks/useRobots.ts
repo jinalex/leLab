@@ -227,6 +227,51 @@ export const useRobots = () => {
     [baseUrl, fetchWithHeaders, toast]
   );
 
+  const updateStadiaSpeed = useCallback(
+    async (name: string, speedMultiplier: number): Promise<boolean> => {
+      try {
+        const res = await fetchWithHeaders(
+          `${baseUrl}/robots/${encodeURIComponent(name)}`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              schema_version: 2,
+              stadia: { speed_multiplier: speedMultiplier },
+            }),
+          },
+        );
+        const data: unknown = await res.json();
+        if (
+          !res.ok ||
+          !isObject(data) ||
+          !hasExactKeys(data, ["status", "robot"]) ||
+          data.status !== "success"
+        ) {
+          throw new Error(
+            isObject(data) && typeof data.message === "string"
+              ? data.message
+              : "The global Stadia speed could not be saved.",
+          );
+        }
+        const record = normalizeRobotRecord(data.robot);
+        if (!record || record.name !== name) {
+          throw new Error("The backend did not return the updated robot profile.");
+        }
+        setRecords((prev) => ({ ...prev, [name]: record }));
+        return true;
+      } catch (e) {
+        toast({
+          title: "Speed was not saved",
+          description: e instanceof Error ? e.message : String(e),
+          variant: "destructive",
+        });
+        return false;
+      }
+    },
+    [baseUrl, fetchWithHeaders, toast],
+  );
+
   const selectedRecord = useMemo(
     () => (selectedName ? records[selectedName] ?? null : null),
     [selectedName, records]
@@ -248,5 +293,6 @@ export const useRobots = () => {
     clearSelection,
     createRobot,
     deleteRobot,
+    updateStadiaSpeed,
   };
 };

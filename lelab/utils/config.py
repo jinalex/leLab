@@ -458,6 +458,7 @@ class StadiaConfig(BaseModel):
     guid: str | None = None
     deadzone: float = Field(default=0.15, ge=0.0, lt=1.0)
     max_step_per_tick: float = Field(default=0.35, gt=0.0, le=0.35)
+    speed_multiplier: float = Field(default=2.0, ge=0.25, le=5.0)
     # RobotRecord V2 files created before removal of the Stadia startup
     # envelope may contain these keys. Accept and validate them on input, but
     # do not expose or persist them again: calibrated endpoints are now the
@@ -484,6 +485,7 @@ class StadiaConfig(BaseModel):
     @field_validator(
         "deadzone",
         "max_step_per_tick",
+        "speed_multiplier",
         "legacy_arm_startup_travel_degrees",
         "legacy_gripper_startup_travel_percentage_points",
         mode="before",
