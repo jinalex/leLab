@@ -977,6 +977,7 @@ def ready_record() -> object:
             guid=None,
             deadzone=0.15,
             max_step_per_tick=0.35,
+            speed_multiplier=4.0,
         ),
         cameras=[
             SimpleNamespace(
@@ -1035,6 +1036,7 @@ def test_builder_resolves_final_id_synchronously_without_mutating_request(
     worker = build_stadia_recording_worker(manager, claim, resolved)  # type: ignore[arg-type]
 
     assert worker.dataset_repo_id.startswith("alex/demo_")
+    assert worker.config.speed_multiplier == 4.0
     assert settings["dataset_repo_id"] == "alex/demo"
     assert resolved.metadata["dataset_repo_id"] == "alex/demo"
     details = manager.status_for("builder-session").details  # type: ignore[union-attr]

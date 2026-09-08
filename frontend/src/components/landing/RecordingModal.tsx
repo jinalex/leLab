@@ -22,6 +22,7 @@ import { AlertTriangle, CheckCircle, ChevronDown } from "lucide-react";
 import CameraConfiguration, {
   type CameraConfig,
 } from "@/components/recording/CameraConfiguration";
+import StadiaStartupInstructions from "@/components/control/StadiaStartupInstructions";
 import { useHfAuth } from "@/contexts/HfAuthContext";
 import type { RobotRecord } from "@/hooks/useRobots";
 import { readinessFor, recordingOperation } from "@/lib/robotConfig";
@@ -333,7 +334,11 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
             </Collapsible>
           </div>
 
-          <div className="flex flex-col sm:flex-row gap-4 justify-center pt-4">
+          {robot?.teleoperator_type === "stadia" && (
+            <StadiaStartupInstructions beforeStart />
+          )}
+
+          <div className="flex flex-col sm:flex-row gap-4 justify-center pt-2">
             <Button
               onClick={onStart}
               disabled={!canStart}

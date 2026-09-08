@@ -52,7 +52,8 @@ THERMAL_INTERVAL_S = 1.0
 FOLLOWER_READ_RETRIES = 5
 MAX_RELATIVE_TARGET = 5.0
 MIN_SPEED_MULTIPLIER = 0.25
-MAX_SPEED_MULTIPLIER = 2.0
+DEFAULT_SPEED_MULTIPLIER = 2.0
+MAX_SPEED_MULTIPLIER = 5.0
 
 _ACTION_TO_URDF_JOINT = {
     "shoulder_pan.pos": "Rotation",
@@ -101,7 +102,8 @@ class StadiaSessionConfig:
     expected_guid: str | None = None
     deadzone: float = 0.15
     max_step_per_tick: float = 0.35
-    startup_timeout_s: float = 5.0
+    speed_multiplier: float = 1.0
+    startup_timeout_s: float = 15.0
     reader_join_timeout_s: float = 2.0
     torque_disable_attempts: int = 2
     cameras: Mapping[str, object] = field(default_factory=dict)
@@ -131,6 +133,12 @@ class StadiaSessionConfig:
 
         self._finite_range("deadzone", self.deadzone, lower=0.0, upper=1.0, upper_inclusive=False)
         self._finite_range("max_step_per_tick", self.max_step_per_tick, lower=0.0, upper=0.35)
+        self._finite_range(
+            "speed_multiplier",
+            self.speed_multiplier,
+            lower=MIN_SPEED_MULTIPLIER,
+            upper=MAX_SPEED_MULTIPLIER,
+        )
         self._finite_range("startup_timeout_s", self.startup_timeout_s, lower=0.0)
         self._finite_range("reader_join_timeout_s", self.reader_join_timeout_s, lower=0.0)
         if (
@@ -496,7 +504,7 @@ class StadiaSessionWorker:
         self._controller_monitoring_active = False
         self._resource_release_unproven = False
         self._speed_lock = threading.Lock()
-        self._speed_multiplier = 1.0
+        self._speed_multiplier = config.speed_multiplier
         self._movement_enabled = False
         self._pending_command_snapshot: StadiaSnapshot | None = None
         self._lifecycle_lock = threading.Lock()

@@ -280,7 +280,10 @@ const validStadiaSettings = (settings: StadiaConfig): boolean =>
   settings.deadzone < 1 &&
   Number.isFinite(settings.max_step_per_tick) &&
   settings.max_step_per_tick > 0 &&
-  settings.max_step_per_tick <= 0.35;
+  settings.max_step_per_tick <= 0.35 &&
+  Number.isFinite(settings.speed_multiplier) &&
+  settings.speed_multiplier >= 0.25 &&
+  settings.speed_multiplier <= 5;
 
 const yesNoUnknown = (value: boolean | null | undefined): string =>
   value == null ? "Unknown" : value ? "Yes" : "No";
@@ -1018,7 +1021,7 @@ const Calibration = () => {
       if (!saved) throw new Error("The robot record no longer exists.");
       toast({
         title: "Stadia settings saved",
-        description: "Controller identity, deadzone, and max step were saved.",
+        description: "Controller identity, deadzone, max step, and global speed were saved.",
       });
     } catch (error) {
       toast({
@@ -1352,7 +1355,7 @@ const Calibration = () => {
                       className="bg-slate-700 border-slate-600 text-white"
                     />
                   </div>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                     <div className="space-y-2">
                       <Label htmlFor="stadiaDeadzone" className="text-xs text-slate-300">
                         Stick deadzone
@@ -1406,9 +1409,38 @@ const Calibration = () => {
                         className="bg-slate-700 border-slate-600 text-white"
                       />
                     </div>
+                    <div className="space-y-2">
+                      <Label htmlFor="stadiaSpeed" className="text-xs text-slate-300">
+                        Global speed multiplier
+                      </Label>
+                      <NumberInput
+                        id="stadiaSpeed"
+                        integer={false}
+                        min="0.25"
+                        max="5"
+                        step="0.25"
+                        value={robot.stadia.speed_multiplier}
+                        onChange={(value) => {
+                          if (value === undefined) return;
+                          setRobot((current) =>
+                            current
+                              ? {
+                                  ...current,
+                                  stadia: {
+                                    ...current.stadia,
+                                    speed_multiplier: value,
+                                  },
+                                }
+                              : current
+                          );
+                        }}
+                        className="bg-slate-700 border-slate-600 text-white"
+                      />
+                    </div>
                   </div>
                   <p className="text-xs text-slate-500">
-                    Stadia movement is bounded by the follower&apos;s calibrated endpoints.
+                    Global speed applies to teleoperation and recording. Stadia movement is
+                    bounded by the follower&apos;s calibrated endpoints.
                     The follower also applies a fixed 5 degree / 5 percentage-point
                     relative-target limit to each command.
                   </p>

@@ -4,8 +4,74 @@ Only installed LeRobot plugins are discovered. A saved record never names a
 Python module to import, and local OpenCV defaults remain unchanged.
 """
 
+import logging
+import math
+import platform
 from collections.abc import Mapping
-from functools import lru_cache
+from functools import lru_cache, wraps
+
+logger = logging.getLogger(__name__)
+
+
+def _fps_matches_requested(requested: object, actual: object) -> bool:
+    """Treat tiny backend clock rounding as the requested frame rate."""
+
+    try:
+        requested_fps = float(requested)
+        actual_fps = float(actual)
+    except (TypeError, ValueError):
+        return False
+    return (
+        math.isfinite(requested_fps)
+        and math.isfinite(actual_fps)
+        and math.isclose(
+            requested_fps,
+            actual_fps,
+            rel_tol=1e-3,
+            abs_tol=1e-3,
+        )
+    )
+
+
+@lru_cache(maxsize=1)
+def install_macos_opencv_fps_compatibility() -> None:
+    """Accept AVFoundation's false setter result when the FPS readback matches.
+
+    Some UVC cameras, including the Opal C1, return ``False`` from
+    ``CAP_PROP_FPS`` while immediately reporting a clock such as 30.00003 FPS.
+    LeRobot otherwise rejects this usable stream before robot construction.
+    """
+
+    if platform.system() != "Darwin":
+        return
+
+    import cv2
+
+    from lerobot.cameras.opencv import OpenCVCamera
+
+    original = OpenCVCamera._validate_fps
+    if getattr(original, "_lelab_macos_fps_compatibility", False):
+        return
+
+    @wraps(original)
+    def validate_fps(self) -> None:
+        try:
+            original(self)
+        except RuntimeError:
+            capture = getattr(self, "videocapture", None)
+            requested = getattr(self, "fps", None)
+            actual = capture.get(cv2.CAP_PROP_FPS) if capture is not None else None
+            if not _fps_matches_requested(requested, actual):
+                raise
+            logger.warning(
+                "AVFoundation rejected the FPS setter but confirmed a matching rate "
+                "(requested=%s, actual=%s); continuing",
+                requested,
+                actual,
+            )
+
+    validate_fps._lelab_macos_fps_compatibility = True  # type: ignore[attr-defined]
+    OpenCVCamera._validate_fps = validate_fps
 
 
 @lru_cache(maxsize=1)
@@ -52,6 +118,8 @@ def camera_cli_config(raw):
 
 
 def build_camera_configs(cameras, default_backend):
+    install_macos_opencv_fps_compatibility()
+
     import draccus
 
     from lerobot.cameras import CameraConfig

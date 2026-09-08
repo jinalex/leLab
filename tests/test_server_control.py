@@ -262,13 +262,13 @@ def test_stadia_speed_route_uses_exact_session_and_returns_revision(robot_store)
     )
     robot_store.coordinator.manager.mark_running(claim.session_id)
 
-    response = server.set_control_speed(server.StadiaSpeedBody(session_id=claim.session_id, multiplier=1.75))
+    response = server.set_control_speed(server.StadiaSpeedBody(session_id=claim.session_id, multiplier=5.0))
 
     assert response["success"] is True
     assert response["session_id"] == claim.session_id
     assert response["status"]["session_id"] == claim.session_id
-    assert response["status"]["details"]["stadia_speed_multiplier"] == 1.75
-    assert robot_store.coordinator.calls[-1] == ("speed", (claim.session_id, 1.75))
+    assert response["status"]["details"]["stadia_speed_multiplier"] == 5.0
+    assert robot_store.coordinator.calls[-1] == ("speed", (claim.session_id, 5.0))
 
 
 def test_failed_runtime_is_not_replaced_by_an_ordinary_request(monkeypatch) -> None:  # type: ignore[no-untyped-def]

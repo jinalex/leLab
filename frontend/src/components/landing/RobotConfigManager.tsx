@@ -19,6 +19,7 @@ interface RobotConfigManagerProps {
   selectRobot: (name: string) => void;
   createRobot: (name: string) => Promise<boolean>;
   deleteRobot: (name: string) => Promise<boolean>;
+  updateStadiaSpeed: (name: string, speedMultiplier: number) => Promise<boolean>;
 }
 
 const RobotConfigManager: React.FC<RobotConfigManagerProps> = ({
@@ -30,6 +31,7 @@ const RobotConfigManager: React.FC<RobotConfigManagerProps> = ({
   selectRobot,
   createRobot,
   deleteRobot,
+  updateStadiaSpeed,
 }) => {
   const navigate = useNavigate();
   const { baseUrl, fetchWithHeaders } = useApi();
@@ -109,6 +111,7 @@ const RobotConfigManager: React.FC<RobotConfigManagerProps> = ({
       onConfigure={handleConfigure}
       onTeleop={handleTeleop}
       onDelete={deleteRobot}
+      onStadiaSpeedChange={updateStadiaSpeed}
     />
   );
 };
