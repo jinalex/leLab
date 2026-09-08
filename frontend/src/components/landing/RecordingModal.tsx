@@ -152,7 +152,6 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
                   >
                     Edit saved robot cameras
                   </Button>
-                  <StadiaStartupInstructions beforeStart />
                 </div>
               )}
             </div>
@@ -335,7 +334,11 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
             </Collapsible>
           </div>
 
-          <div className="flex flex-col sm:flex-row gap-4 justify-center pt-4">
+          {robot?.teleoperator_type === "stadia" && (
+            <StadiaStartupInstructions beforeStart />
+          )}
+
+          <div className="flex flex-col sm:flex-row gap-4 justify-center pt-2">
             <Button
               onClick={onStart}
               disabled={!canStart}

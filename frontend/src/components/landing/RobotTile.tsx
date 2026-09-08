@@ -21,6 +21,7 @@ import {
   teleoperationOperation,
 } from "@/lib/robotConfig";
 import RobotSelector from "./RobotSelector";
+import StadiaStartupInstructions from "@/components/control/StadiaStartupInstructions";
 
 interface RobotTileProps {
   robot: RobotRecord | null;
@@ -48,6 +49,7 @@ const RobotTile: React.FC<RobotTileProps> = ({
   onDelete,
 }) => {
   const [confirmDelete, setConfirmDelete] = useState(false);
+  const [confirmStadiaTeleop, setConfirmStadiaTeleop] = useState(false);
   const teleopReadiness = robot
     ? readinessFor(robot, teleoperationOperation(robot))
     : null;
@@ -130,7 +132,13 @@ const RobotTile: React.FC<RobotTileProps> = ({
           <TooltipTrigger asChild>
             <div className="w-full">
               <Button
-                onClick={() => onTeleop(robot)}
+                onClick={() => {
+                  if (robot.teleoperator_type === "stadia") {
+                    setConfirmStadiaTeleop(true);
+                    return;
+                  }
+                  onTeleop(robot);
+                }}
                 disabled={teleopDisabled}
                 className={`w-full ${
                   teleopDisabled
@@ -148,6 +156,38 @@ const RobotTile: React.FC<RobotTileProps> = ({
             </TooltipContent>
           )}
         </Tooltip>
+      )}
+
+      {robot?.teleoperator_type === "stadia" && (
+        <Dialog open={confirmStadiaTeleop} onOpenChange={setConfirmStadiaTeleop}>
+          <DialogContent className="bg-gray-900 border-gray-800 text-white">
+            <DialogHeader>
+              <DialogTitle>Start Stadia teleoperation?</DialogTitle>
+              <DialogDescription className="text-gray-400">
+                Complete this quick trigger setup immediately after starting.
+              </DialogDescription>
+            </DialogHeader>
+            <StadiaStartupInstructions beforeStart />
+            <DialogFooter className="flex gap-2 justify-end">
+              <Button
+                variant="outline"
+                className="border-gray-600 text-gray-300"
+                onClick={() => setConfirmStadiaTeleop(false)}
+              >
+                Cancel
+              </Button>
+              <Button
+                className="bg-yellow-500 hover:bg-yellow-600 text-white"
+                onClick={() => {
+                  setConfirmStadiaTeleop(false);
+                  onTeleop(robot);
+                }}
+              >
+                Start Stadia Teleoperation
+              </Button>
+            </DialogFooter>
+          </DialogContent>
+        </Dialog>
       )}
 
       {robot && (
