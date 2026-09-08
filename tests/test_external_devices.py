@@ -10,7 +10,12 @@ import numpy as np
 import pytest
 from fastapi import HTTPException
 
-from lelab.utils.cameras import build_camera_configs, camera_cli_config, camera_projection
+from lelab.utils.cameras import (
+    _fps_matches_requested,
+    build_camera_configs,
+    camera_cli_config,
+    camera_projection,
+)
 from lelab.utils.config import CameraRecord, RobotRecordV2
 from lelab.utils.python_process import python_module_command
 from lerobot.cameras import CameraConfig
@@ -32,6 +37,14 @@ def saved_camera():
         fps=10,
         parameters={"host": "127.0.0.1", "port": 17447},
     )
+
+
+@pytest.mark.parametrize(
+    ("requested", "actual", "matches"),
+    [(30, 30.00003, True), (30, 29.97, False), (30, float("nan"), False)],
+)
+def test_camera_fps_clock_rounding_match(requested, actual, matches):
+    assert _fps_matches_requested(requested, actual) is matches
 
 
 def test_plugin_projection_constructor_and_cli_round_trip(monkeypatch):
