@@ -27,6 +27,7 @@ import {
 } from "@/lib/recordingAudio";
 import { useApi } from "@/contexts/ApiContext";
 import ControlSessionPanel from "@/components/control/ControlSessionPanel";
+import StadiaStartupInstructions from "@/components/control/StadiaStartupInstructions";
 import { useControlSession } from "@/hooks/useControlSession";
 import {
   requireControlStatusEnvelope,
@@ -1180,6 +1181,9 @@ const Recording = () => {
         <div className="w-full max-w-2xl space-y-5 text-center">
           <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-red-500 mx-auto mb-4"></div>
           <p className="text-lg">Connecting to recording session...</p>
+          {navigationState?.teleoperator_type === "stadia" && (
+            <StadiaStartupInstructions />
+          )}
           {controlSessionId && (
             <ControlSessionPanel
               status={control.status}
@@ -1275,6 +1279,13 @@ const Recording = () => {
         </div>
 
         <div className="bg-gray-900 rounded-lg border border-gray-700 p-6 flex-1 min-h-0 flex flex-col justify-center">
+          {navigationState?.teleoperator_type === "stadia" &&
+            currentPhase === "preparing" &&
+            !backendStatus.session_ended && (
+              <div className="mb-3 flex-shrink-0">
+                <StadiaStartupInstructions />
+              </div>
+            )}
           <div className="mb-3 max-h-64 flex-shrink-0 overflow-y-auto">
             <ControlSessionPanel
               status={control.status}

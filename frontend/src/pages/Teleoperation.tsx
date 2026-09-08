@@ -3,6 +3,7 @@ import { useLocation, useNavigate } from "react-router-dom";
 import VisualizerPanel from "@/components/control/VisualizerPanel";
 import TeleopCameraPanel from "@/components/control/TeleopCameraPanel";
 import ControlSessionPanel from "@/components/control/ControlSessionPanel";
+import StadiaStartupInstructions from "@/components/control/StadiaStartupInstructions";
 import { useToast } from "@/hooks/use-toast";
 import { useControlSession } from "@/hooks/useControlSession";
 import { useApi } from "@/contexts/ApiContext";
@@ -216,6 +217,10 @@ const TeleoperationPage = () => {
           className="lg:w-full"
           rightSlot={
             <div className="flex h-full min-h-0 flex-col gap-4 overflow-y-auto">
+              {navigation.teleoperator_type === "stadia" &&
+                control.status?.state === "starting" && (
+                  <StadiaStartupInstructions />
+                )}
               {navigation.teleoperator_type === "stadia" && (
                 <div className="rounded-lg border border-slate-700 bg-slate-900/80 p-4 text-white">
                   <div className="flex items-center justify-between gap-3">

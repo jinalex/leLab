@@ -103,7 +103,7 @@ class StadiaSessionConfig:
     deadzone: float = 0.15
     max_step_per_tick: float = 0.35
     speed_multiplier: float = 1.0
-    startup_timeout_s: float = 5.0
+    startup_timeout_s: float = 15.0
     reader_join_timeout_s: float = 2.0
     torque_disable_attempts: int = 2
     cameras: Mapping[str, object] = field(default_factory=dict)

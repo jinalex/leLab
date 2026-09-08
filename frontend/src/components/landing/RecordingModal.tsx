@@ -22,6 +22,7 @@ import { AlertTriangle, CheckCircle, ChevronDown } from "lucide-react";
 import CameraConfiguration, {
   type CameraConfig,
 } from "@/components/recording/CameraConfiguration";
+import StadiaStartupInstructions from "@/components/control/StadiaStartupInstructions";
 import { useHfAuth } from "@/contexts/HfAuthContext";
 import type { RobotRecord } from "@/hooks/useRobots";
 import { readinessFor, recordingOperation } from "@/lib/robotConfig";
@@ -151,6 +152,7 @@ const RecordingModal: React.FC<RecordingModalProps> = ({
                   >
                     Edit saved robot cameras
                   </Button>
+                  <StadiaStartupInstructions beforeStart />
                 </div>
               )}
             </div>
