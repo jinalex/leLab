@@ -727,18 +727,18 @@ def test_live_speed_change_requires_rb_release_and_updates_exact_joint_caps() ->
     )
     harness.follower.stop_after_sends = 2
     harness.follower.send_hook = lambda count: (
-        harness.worker.set_speed_multiplier(2.0) if count == 1 else None
+        harness.worker.set_speed_multiplier(5.0) if count == 1 else None
     )
 
     result = harness.worker.run()
 
     assert result.movement_steps == 1
-    assert harness.follower.sent_actions[1]["shoulder_pan.pos"] == pytest.approx(-0.7)
+    assert harness.follower.sent_actions[1]["shoulder_pan.pos"] == pytest.approx(-1.75)
     status = harness.manager.status_for("stadia-session", check_expiry=False)
     assert status is not None
-    assert status.details["stadia_speed_multiplier"] == 2.0
-    assert status.details["stadia_effective_max_step_per_tick"] == pytest.approx(0.7)
-    assert all(spec.max_step_per_tick == pytest.approx(0.7) for spec in status.joint_specs)
+    assert status.details["stadia_speed_multiplier"] == 5.0
+    assert status.details["stadia_effective_max_step_per_tick"] == pytest.approx(1.75)
+    assert all(spec.max_step_per_tick == pytest.approx(1.75) for spec in status.joint_specs)
 
 
 def test_live_speed_change_is_rejected_while_rb_enables_motion() -> None:

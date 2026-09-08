@@ -10,7 +10,8 @@ import { Button } from "@/components/ui/button";
 import type { ControlStatus, RobotOperation, TeleoperatorType } from "@/lib/robotConfig";
 
 const MIN_STADIA_SPEED = 0.25;
-const MAX_STADIA_SPEED = 2;
+const DEFAULT_STADIA_SPEED = 2;
+const MAX_STADIA_SPEED = 5;
 const STADIA_SPEED_STEP = 0.25;
 
 const statusSpeed = (status: ControlStatus | null): number | null => {
@@ -61,7 +62,7 @@ const TeleoperationPage = () => {
   const { baseUrl, fetchWithHeaders } = useApi();
   const navigation = parseNavigationState(location.state);
   const [leaveAfterStop, setLeaveAfterStop] = useState(false);
-  const [speedMultiplier, setSpeedMultiplier] = useState(1);
+  const [speedMultiplier, setSpeedMultiplier] = useState(DEFAULT_STADIA_SPEED);
   const [speedPending, setSpeedPending] = useState(false);
   const [speedEditing, setSpeedEditing] = useState(false);
   const terminalToastRef = useRef(false);
@@ -191,7 +192,7 @@ const TeleoperationPage = () => {
         }
         setSpeedMultiplier(reported);
       } catch (error) {
-        setSpeedMultiplier(statusSpeed(control.status) ?? 1);
+        setSpeedMultiplier(statusSpeed(control.status) ?? DEFAULT_STADIA_SPEED);
         toast({
           title: "Speed unchanged",
           description:

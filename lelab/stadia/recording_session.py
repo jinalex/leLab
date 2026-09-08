@@ -49,6 +49,7 @@ from .recording import (
 )
 from .session import (
     CONTROL_RATE_HZ,
+    DEFAULT_SPEED_MULTIPLIER,
     MAX_SNAPSHOT_AGE_S,
     FollowerBuildSpec,
     StadiaSessionConfig,
@@ -1039,6 +1040,7 @@ def build_stadia_recording_worker(
             expected_guid=record.stadia.guid,
             deadzone=record.stadia.deadzone,
             max_step_per_tick=record.stadia.max_step_per_tick,
+            speed_multiplier=DEFAULT_SPEED_MULTIPLIER,
             cameras=canonical_cameras,
         ),
         recording_config=recording_config,

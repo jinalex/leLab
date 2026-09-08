@@ -937,8 +937,8 @@ def test_default_stadia_teleoperation_receives_the_websocket_broadcaster(
 
     assert result["success"] is True
     assert received == [socket_manager]
-    assert result["status"]["details"]["stadia_speed_multiplier"] == 1.0
-    assert result["status"]["details"]["stadia_effective_max_step_per_tick"] == 0.35
+    assert result["status"]["details"]["stadia_speed_multiplier"] == 2.0
+    assert result["status"]["details"]["stadia_effective_max_step_per_tick"] == 0.7
     coordinator.request_stop(str(result["session_id"]))
     wait_for_terminal(manager, str(result["session_id"]))
 

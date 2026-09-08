@@ -484,8 +484,8 @@ class ControlCoordinator:
                 teleoperator_type="stadia",
                 details={
                     "robot_name": resolved.robot_name,
-                    "stadia_speed_multiplier": 1.0,
-                    "stadia_effective_max_step_per_tick": record.stadia.max_step_per_tick,
+                    "stadia_speed_multiplier": 2.0,
+                    "stadia_effective_max_step_per_tick": record.stadia.max_step_per_tick * 2.0,
                 },
             )
         except ControlOwnerStartError as error:
@@ -674,7 +674,7 @@ class ControlCoordinator:
         *,
         websocket_manager: object | None = None,
     ) -> ManagedWorker:
-        from .stadia.session import StadiaSessionConfig, StadiaSessionWorker
+        from .stadia.session import DEFAULT_SPEED_MULTIPLIER, StadiaSessionConfig, StadiaSessionWorker
         from .utils.cameras import camera_projection
 
         record = resolved.record_model()
@@ -694,6 +694,7 @@ class ControlCoordinator:
                 expected_guid=record.stadia.guid,
                 deadzone=record.stadia.deadzone,
                 max_step_per_tick=record.stadia.max_step_per_tick,
+                speed_multiplier=DEFAULT_SPEED_MULTIPLIER,
                 # Browser cameras remain browser-owned. Installed plugin
                 # cameras belong to this worker and share its cleanup path.
                 cameras={c.name: camera_projection(c) for c in record.cameras if c.type != "opencv"},
