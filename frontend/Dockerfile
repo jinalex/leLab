@@ -1,5 +1,5 @@
 # Vite 8 requires Node ^20.19.0 or >=22.12.0.
-FROM node:22-alpine
+FROM node:22.23.4-alpine
 
 # Use the existing node user (usually UID 1000)
 # Set up environment variables for the node user
